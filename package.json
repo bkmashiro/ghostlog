@@ -15,7 +15,13 @@
     "onLanguage:javascript",
     "onLanguage:javascriptreact",
     "onLanguage:typescript",
-    "onLanguage:typescriptreact"
+    "onLanguage:typescriptreact",
+    "onView:ghostlog.logViewer",
+    "onCommand:ghostlog.addLogpoint",
+    "onCommand:ghostlog.snapshotLogs",
+    "onCommand:ghostlog.diffLogs",
+    "onCommand:ghostlog.startMcp",
+    "onCommand:ghostlog.stopMcp"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -31,8 +37,46 @@
       {
         "command": "ghostlog.clearFile",
         "title": "GhostLog: Clear This File"
+      },
+      {
+        "command": "ghostlog.addLogpoint",
+        "title": "GhostLog: Add Logpoint Here"
+      },
+      {
+        "command": "ghostlog.snapshotLogs",
+        "title": "GhostLog: Snapshot Current Logs"
+      },
+      {
+        "command": "ghostlog.diffLogs",
+        "title": "GhostLog: Diff with Last Snapshot"
+      },
+      {
+        "command": "ghostlog.startMcp",
+        "title": "GhostLog: Start MCP Server"
+      },
+      {
+        "command": "ghostlog.stopMcp",
+        "title": "GhostLog: Stop MCP Server"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ghostlog",
+          "title": "GhostLog",
+          "icon": "media/ghostlog.svg"
+        }
+      ]
+    },
+    "views": {
+      "ghostlog": [
+        {
+          "id": "ghostlog.logViewer",
+          "name": "Log Viewer",
+          "type": "webview"
+        }
+      ]
+    },
     "configuration": {
       "title": "GhostLog",
       "properties": {
@@ -50,6 +94,16 @@
           "type": "boolean",
           "default": true,
           "description": "Enable/disable inline display"
+        },
+        "ghostlog.mcpEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the GhostLog MCP server"
+        },
+        "ghostlog.mcpPort": {
+          "type": "number",
+          "default": 5678,
+          "description": "Port for the GhostLog MCP server"
         }
       }
     }

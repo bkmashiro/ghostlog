@@ -1,6 +1,13 @@
 import assert from 'node:assert'
 import test from 'node:test'
-import { formatValues, groupEntries, parseLogLine, truncateValue } from '../src/parser.js'
+import {
+  formatValues,
+  groupEntries,
+  parseLogLine,
+  parseStructuredPayload,
+  truncateValue,
+  GHOSTLOG_PREFIX
+} from '../src/parser.js'
 
 test('parseLogLine extracts label and value from "user: {...}"', () => {
   const entry = parseLogLine("user: { id: 1, name: 'Alice' }", 'log')
@@ -45,4 +52,11 @@ test('groupEntries shows (+N more) when overflow', () => {
 test('groupEntries returns single value when only 1 entry', () => {
   const entries = [parseLogLine('value', 'log')]
   assert.equal(groupEntries(entries), 'value')
+})
+
+test('parseStructuredPayload parses GhostLog runtime payloads', () => {
+  const payload = parseStructuredPayload(
+    `${GHOSTLOG_PREFIX}{"type":"network","method":"GET","url":"/api/users"}`
+  )
+  assert.equal(payload?.type, 'network')
 })

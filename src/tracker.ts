@@ -1,13 +1,15 @@
-import type { LogEntry } from './parser.js'
+import type { LogEntry, NetworkEntry } from './types.js'
 
 export interface LogLocation {
   file: string
   line: number
   column: number
   callText: string
+  kind: 'console' | 'network'
 }
 
-const CONSOLE_METHODS = ['log', 'warn', 'error', 'info'] as const
+const CONSOLE_METHODS = ['log', 'warn', 'error', 'info', 'time', 'timeEnd'] as const
+const NETWORK_PATTERNS = [/fetch\s*\(/g, /axios(?:\.[a-zA-Z]+)?\s*\(/g]
 
 function indexToLineColumn(content: string, index: number): { line: number; column: number } {
   let line = 0
@@ -68,7 +70,7 @@ function scanCallEnd(content: string, openParenIndex: number): number {
 }
 
 function extractFirstStringLiteral(callText: string): string | null {
-  const match = callText.match(/console\.(?:log|warn|error|info)\s*\(\s*(["'`])((?:\\.|(?!\1).)*)\1/s)
+  const match = callText.match(/console\.(?:log|warn|error|info|time|timeEnd)\s*\(\s*(["'`])((?:\\.|(?!\1).)*)\1/s)
   if (!match) {
     return null
   }
@@ -112,7 +114,41 @@ export function findLogLocations(fileContent: string, filePath: string): LogLoca
         file: filePath,
         line,
         column,
-        callText: fileContent.slice(start, end + 1)
+        callText: fileContent.slice(start, end + 1),
+        kind: 'console'
+      })
+    }
+  }
+
+  return locations.sort((left, right) => {
+    if (left.line !== right.line) {
+      return left.line - right.line
+    }
+    return left.column - right.column
+  })
+}
+
+export function findNetworkLocations(fileContent: string, filePath: string): LogLocation[] {
+  const locations: LogLocation[] = []
+
+  for (const pattern of NETWORK_PATTERNS) {
+    for (const match of fileContent.matchAll(pattern)) {
+      const start = match.index ?? -1
+      if (start < 0) {
+        continue
+      }
+      const openParenIndex = fileContent.indexOf('(', start)
+      const end = scanCallEnd(fileContent, openParenIndex)
+      if (end < 0) {
+        continue
+      }
+      const { line, column } = indexToLineColumn(fileContent, start)
+      locations.push({
+        file: filePath,
+        line,
+        column,
+        callText: fileContent.slice(start, end + 1),
+        kind: 'network'
       })
     }
   }
@@ -154,4 +190,41 @@ export function matchOutputToLocation(
   }
 
   return locations.length === 1 ? locations[0] : null
+}
+
+function networkSimilarity(url: string, callText: string): number {
+  if (!url) {
+    return 0
+  }
+  if (callText.includes(url)) {
+    return 100
+  }
+  const pathname = url.split('?')[0]
+  if (pathname && callText.includes(pathname)) {
+    return 80
+  }
+  return 0
+}
+
+export function matchNetworkToLocation(
+  output: NetworkEntry,
+  locations: LogLocation[]
+): LogLocation | null {
+  if (locations.length === 0) {
+    return null
+  }
+
+  const ranked = locations
+    .map((location) => ({
+      location,
+      score: networkSimilarity(output.url, location.callText)
+    }))
+    .sort((left, right) => {
+      if (left.score !== right.score) {
+        return right.score - left.score
+      }
+      return left.location.line - right.location.line
+    })
+
+  return ranked[0]?.location ?? null
 }

@@ -8,7 +8,7 @@
     ],
     "strict": true,
     "outDir": "out",
-    "rootDir": "src",
+    "rootDir": ".",
     "skipLibCheck": true
   },
   "include": [

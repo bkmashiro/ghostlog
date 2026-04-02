@@ -1,9 +1,20 @@
-export interface LogEntry {
-  raw: string
-  level: 'log' | 'warn' | 'error' | 'info'
-  values: string[]
+import type { LogEntry, LogLevel, NetworkEntry } from './types.js'
+
+export const GHOSTLOG_PREFIX = '__GHOSTLOG__'
+
+export interface StructuredPayload {
+  type: 'network' | 'timing'
+  timestamp?: number
+  transport?: string
+  url?: string
+  method?: string
+  status?: number
+  error?: string
+  duration?: number
+  phase?: 'start' | 'end'
   label?: string
-  timestamp: number
+  startTime?: number
+  endTime?: number
 }
 
 function splitTopLevelValues(input: string): string[] {
@@ -169,7 +180,7 @@ function extractLabel(line: string): { label?: string; rest: string } {
   return { rest: line.trim() }
 }
 
-export function parseLogLine(line: string, level: LogEntry['level']): LogEntry {
+export function parseLogLine(line: string, level: LogLevel): LogEntry {
   const raw = line.trim()
   const looksLikeRuntimeError = /^([A-Z][A-Za-z0-9]*Error|Error):/.test(raw)
   const { label, rest } = extractLabel(raw)
@@ -186,6 +197,19 @@ export function parseLogLine(line: string, level: LogEntry['level']): LogEntry {
     values,
     label,
     timestamp: Date.now()
+  }
+}
+
+export function parseStructuredPayload(line: string): StructuredPayload | null {
+  const raw = line.trim()
+  if (!raw.startsWith(GHOSTLOG_PREFIX)) {
+    return null
+  }
+
+  try {
+    return JSON.parse(raw.slice(GHOSTLOG_PREFIX.length)) as StructuredPayload
+  } catch {
+    return null
   }
 }
 
@@ -213,4 +237,29 @@ export function groupEntries(entries: LogEntry[], maxShow = 5): string {
     return base
   }
   return `${base}  ... (+${remaining} more)`
+}
+
+export function parseNetworkLine(line: string): NetworkEntry | null {
+  const match = line.trim().match(/^([A-Z]+)\s+(\S+)(?:\s+(\d{3}|✗)\s+(.+))?$/)
+  if (!match) {
+    return null
+  }
+
+  const [, method, url, statusOrError, tail] = match
+  const durationMatch = tail?.match(/([0-9]+(?:\.[0-9]+)?)ms/)
+  return {
+    method,
+    url,
+    status: statusOrError && /^\d{3}$/.test(statusOrError) ? Number(statusOrError) : undefined,
+    error: statusOrError === '✗' ? tail : undefined,
+    duration: durationMatch ? Number(durationMatch[1]) : 0,
+    timestamp: Date.now()
+  }
+}
+
+export function formatNetworkEntry(entry: NetworkEntry): string {
+  if (entry.error) {
+    return `🌐 ${entry.method} ✗ ${entry.error}`
+  }
+  return `🌐 ${entry.method} ${entry.status ?? 'ERR'} ${entry.duration}ms`
 }
