@@ -717,6 +717,373 @@ function handleMethod(method, params, dataSource) {
   }
 }
 
+// src/repl.ts
+var vm = __toESM(require("node:vm"));
+function reviveCapturedValue(value) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed === "undefined") {
+    return void 0;
+  }
+  if (trimmed === "null") {
+    return null;
+  }
+  if (trimmed === "true") {
+    return true;
+  }
+  if (trimmed === "false") {
+    return false;
+  }
+  if (/^-?(?:\d+|\d*\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed)) {
+    return Number(trimmed);
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+  }
+  try {
+    return vm.runInNewContext(`(${trimmed})`, /* @__PURE__ */ Object.create(null), { timeout: 50 });
+  } catch {
+    return trimmed;
+  }
+}
+var GhostlogRepl = class {
+  context = { $last: void 0 };
+  history = [];
+  updateContext(entries) {
+    const nextContext = { $last: void 0 };
+    let index = 0;
+    for (const [key, value] of entries) {
+      nextContext[`$${index}`] = value;
+      nextContext[key] = value;
+      nextContext.$last = value;
+      index += 1;
+    }
+    this.context = nextContext;
+  }
+  updateFromCaptured(values) {
+    const entries = /* @__PURE__ */ new Map();
+    for (const value of values) {
+      entries.set(value.key, reviveCapturedValue(value.raw));
+    }
+    this.updateContext(entries);
+  }
+  evaluate(expression) {
+    try {
+      const sandbox = {
+        ...this.context,
+        JSON,
+        Math,
+        Array,
+        Object,
+        String,
+        Number,
+        Boolean,
+        Date,
+        RegExp
+      };
+      const result = vm.runInNewContext(expression, sandbox, { timeout: 1e3 });
+      const entry = {
+        input: expression,
+        output: formatValue(result),
+        timestamp: Date.now()
+      };
+      this.history.push(entry);
+      return entry;
+    } catch (error) {
+      const entry = {
+        input: expression,
+        output: "",
+        error: String(error),
+        timestamp: Date.now()
+      };
+      this.history.push(entry);
+      return entry;
+    }
+  }
+  getHistory() {
+    return [...this.history];
+  }
+  clearHistory() {
+    this.history = [];
+  }
+  getContext() {
+    return { ...this.context };
+  }
+};
+function formatValue(value, maxDepth = 3) {
+  if (value === void 0) {
+    return "undefined";
+  }
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return "[]";
+    }
+    if (maxDepth <= 0) {
+      return `[ ...${value.length} items ]`;
+    }
+    if (value.length > 10) {
+      return `[ ...${value.length} items ]`;
+    }
+    const preview = value.slice(0, 5).map((entry) => formatValue(entry, maxDepth - 1)).join(", ");
+    return `[ ${preview}${value.length > 5 ? ", ..." : ""} ]`;
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value);
+    if (keys.length === 0) {
+      return "{}";
+    }
+    if (maxDepth <= 0) {
+      return `{ ...${keys.length} keys }`;
+    }
+    const preview = keys.slice(0, 4).map((key) => `${key}: ${formatValue(value[key], maxDepth - 1)}`).join(", ");
+    return `{ ${preview}${keys.length > 4 ? ", ..." : ""} }`;
+  }
+  return String(value);
+}
+
+// src/repl-panel.ts
+var ReplPanelProvider = class {
+  static viewType = "ghostlog.repl";
+  repl = new GhostlogRepl();
+  view;
+  resolveWebviewView(webviewView) {
+    this.view = webviewView;
+    webviewView.webview.options = { enableScripts: true };
+    webviewView.webview.html = this.getHtml(webviewView.webview);
+    webviewView.webview.onDidReceiveMessage((message) => {
+      if (message.type === "evaluate" && typeof message.expression === "string") {
+        this.repl.evaluate(message.expression);
+        void this.postState();
+      } else if (message.type === "clear") {
+        this.repl.clearHistory();
+        void this.postState();
+      }
+    });
+    void this.postState();
+  }
+  updateValues(values) {
+    this.repl.updateContext(values);
+    void this.postState();
+  }
+  updateCapturedValues(values) {
+    this.repl.updateFromCaptured(values);
+    void this.postState();
+  }
+  async postState() {
+    if (!this.view) {
+      return;
+    }
+    const context = this.repl.getContext();
+    await this.view.webview.postMessage({
+      type: "state",
+      summary: this.buildContextSummary(context),
+      variables: this.buildVariableList(context),
+      history: this.repl.getHistory()
+    });
+  }
+  buildContextSummary(context) {
+    const names = Object.keys(context).filter((key) => key === "$last" || /^\$\d+$/.test(key));
+    if (names.length === 0) {
+      return "No values captured yet";
+    }
+    return names.slice(0, 6).map((name) => `${name} = ${formatValue(context[name], 2)}`).join("\n");
+  }
+  buildVariableList(context) {
+    return Object.keys(context).filter((key) => key.startsWith("$")).sort((left, right) => {
+      if (left === "$last") {
+        return 1;
+      }
+      if (right === "$last") {
+        return -1;
+      }
+      return left.localeCompare(right, void 0, { numeric: true });
+    });
+  }
+  getHtml(_webview) {
+    const nonce = String(Date.now());
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      background: var(--vscode-editor-background);
+      color: var(--vscode-editor-foreground);
+      font-family: var(--vscode-editor-font-family);
+      font-size: 13px;
+      margin: 0;
+      padding: 8px;
+    }
+    .context {
+      border-bottom: 1px solid var(--vscode-panel-border);
+      margin-bottom: 8px;
+      padding-bottom: 8px;
+      white-space: pre-wrap;
+      opacity: 0.85;
+    }
+    .context-vars {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      margin-top: 6px;
+      word-break: break-word;
+    }
+    .history {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: calc(100vh - 140px);
+      overflow-y: auto;
+    }
+    .entry {
+      border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 65%, transparent);
+      padding-bottom: 8px;
+    }
+    .prompt {
+      color: var(--vscode-terminal-ansiGreen);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .result {
+      color: var(--vscode-terminal-ansiBrightBlue);
+      margin-left: 16px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .error {
+      color: var(--vscode-terminal-ansiRed);
+      margin-left: 16px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .input-row {
+      align-items: center;
+      border-top: 1px solid var(--vscode-panel-border);
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+      padding-top: 8px;
+      position: sticky;
+      bottom: 0;
+      background: var(--vscode-editor-background);
+    }
+    .input-prompt {
+      color: var(--vscode-terminal-ansiGreen);
+      flex: none;
+    }
+    input {
+      background: transparent;
+      border: none;
+      color: inherit;
+      flex: 1;
+      font: inherit;
+      outline: none;
+      min-width: 0;
+    }
+    button {
+      background: transparent;
+      border: 1px solid var(--vscode-button-border, transparent);
+      color: var(--vscode-button-foreground);
+      cursor: pointer;
+      font: inherit;
+      opacity: 0.8;
+      padding: 2px 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="context" id="context">No values captured yet</div>
+  <div class="context-vars" id="vars">$0, $1, $last</div>
+  <div class="history" id="history"></div>
+  <div class="input-row">
+    <span class="input-prompt">&gt;</span>
+    <input type="text" id="input" placeholder="$0?.value, $last, JSON.stringify($1)" autofocus />
+    <button id="clear" type="button">clear</button>
+  </div>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const input = document.getElementById('input');
+    const historyEl = document.getElementById('history');
+    const contextEl = document.getElementById('context');
+    const varsEl = document.getElementById('vars');
+    const commandHistory = [];
+    let historyIndex = -1;
+
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && input.value.trim()) {
+        const expression = input.value.trim();
+        commandHistory.unshift(expression);
+        historyIndex = -1;
+        input.value = '';
+        vscode.postMessage({ type: 'evaluate', expression });
+      } else if (event.key === 'ArrowUp') {
+        historyIndex = Math.min(historyIndex + 1, commandHistory.length - 1);
+        input.value = commandHistory[historyIndex] || '';
+        event.preventDefault();
+      } else if (event.key === 'ArrowDown') {
+        historyIndex = Math.max(historyIndex - 1, -1);
+        input.value = historyIndex >= 0 ? commandHistory[historyIndex] : '';
+        event.preventDefault();
+      }
+    });
+
+    document.getElementById('clear').addEventListener('click', () => {
+      vscode.postMessage({ type: 'clear' });
+    });
+
+    window.addEventListener('message', ({ data }) => {
+      if (data.type === 'state') {
+        contextEl.textContent = data.summary;
+        varsEl.textContent = data.variables.length ? 'Available: ' + data.variables.join(', ') : '';
+        renderHistory(data.history);
+      }
+    });
+
+    function renderHistory(results) {
+      historyEl.innerHTML = '';
+      for (const result of results) {
+        appendResult(result);
+      }
+    }
+
+    function appendResult(result) {
+      const div = document.createElement('div');
+      div.className = 'entry';
+      div.innerHTML = '<div class="prompt">&gt; ' + escapeHtml(result.input) + '</div>' +
+        (result.error
+          ? '<div class="error">\u2717 ' + escapeHtml(result.error) + '</div>'
+          : '<div class="result">\u2190 ' + escapeHtml(result.output) + '</div>');
+      historyEl.appendChild(div);
+      historyEl.scrollTop = historyEl.scrollHeight;
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+  </script>
+</body>
+</html>`;
+  }
+};
+
 // src/tracker.ts
 var CONSOLE_METHODS = ["log", "warn", "error", "info", "time", "timeEnd"];
 var NETWORK_PATTERNS = [/fetch\s*\(/g, /axios(?:\.[a-zA-Z]+)?\s*\(/g];
@@ -931,6 +1298,7 @@ var GhostLogController = class {
   diffManager = new LogDiffManager();
   logViewer;
   logpointManager;
+  replPanel = new ReplPanelProvider();
   ghostlogBreakpoints = [];
   currentDiff;
   mcpServer;
@@ -960,6 +1328,7 @@ var GhostLogController = class {
     );
     disposables.push(
       vscode4.window.registerWebviewViewProvider(LogViewerProvider.viewType, this.logViewer),
+      vscode4.window.registerWebviewViewProvider(ReplPanelProvider.viewType, this.replPanel),
       vscode4.languages.registerHoverProvider(
         ["javascript", "javascriptreact", "typescript", "typescriptreact"],
         new LogHoverProvider({
@@ -1046,6 +1415,7 @@ var GhostLogController = class {
     this.entryOrder.length = 0;
     this.currentDiff = void 0;
     this.refreshViewer();
+    this.syncReplContext();
     this.renderAllVisibleEditors();
   }
   clearFile(filePath) {
@@ -1059,6 +1429,7 @@ var GhostLogController = class {
       }
     }
     this.refreshViewer();
+    this.syncReplContext();
     this.renderAllVisibleEditors();
   }
   toggle() {
@@ -1213,7 +1584,22 @@ var GhostLogController = class {
     this.entryOrder.push(entry);
     this.currentDiff = void 0;
     this.refreshViewer();
+    this.syncReplContext();
     this.renderEditorForFile(filePath);
+  }
+  syncReplContext() {
+    const recentEntries = this.entryOrder.filter((entry) => entry.kind !== "network" && entry.kind !== "timing").slice(-25).reverse();
+    const values = [];
+    for (const [index, entry] of recentEntries.entries()) {
+      const rawValue = entry.values.length <= 1 ? entry.values[0] ?? entry.raw : `[${entry.values.join(", ")}]`;
+      values.push({ key: this.toReplKey(entry, index), raw: rawValue });
+    }
+    this.replPanel.updateCapturedValues(values);
+  }
+  toReplKey(entry, index) {
+    const fileName = entry.file ? import_node_path2.default.basename(entry.file).replace(/[^A-Za-z0-9_$]/g, "_") : "unknown";
+    const line = typeof entry.line === "number" ? entry.line + 1 : index;
+    return `$${fileName}_${line}`;
   }
   getEntriesForLine(filePath, line) {
     return this.entriesByFile.get(filePath)?.get(line) ?? [];

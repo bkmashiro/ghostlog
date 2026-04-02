@@ -8,6 +8,7 @@ import { generateInjectionScript } from './injector.js'
 import { LogViewerProvider } from './log-viewer.js'
 import { LogpointManager, type Logpoint } from './logpoint.js'
 import { startMcpServer, type McpServerHandle } from './mcp-server.js'
+import { ReplPanelProvider } from './repl-panel.js'
 import {
   formatNetworkEntry,
   parseLogLine,
@@ -37,6 +38,7 @@ class GhostLogController {
   private readonly diffManager = new LogDiffManager()
   private readonly logViewer: LogViewerProvider
   private readonly logpointManager: LogpointManager
+  private readonly replPanel = new ReplPanelProvider()
   private ghostlogBreakpoints: vscode.SourceBreakpoint[] = []
   private currentDiff?: LogDiff
   private mcpServer?: McpServerHandle
@@ -86,6 +88,7 @@ class GhostLogController {
 
     disposables.push(
       vscode.window.registerWebviewViewProvider(LogViewerProvider.viewType, this.logViewer),
+      vscode.window.registerWebviewViewProvider(ReplPanelProvider.viewType, this.replPanel),
       vscode.languages.registerHoverProvider(
         ['javascript', 'javascriptreact', 'typescript', 'typescriptreact'],
         new LogHoverProvider({
@@ -186,6 +189,7 @@ class GhostLogController {
     this.entryOrder.length = 0
     this.currentDiff = undefined
     this.refreshViewer()
+    this.syncReplContext()
     this.renderAllVisibleEditors()
   }
 
@@ -200,6 +204,7 @@ class GhostLogController {
       }
     }
     this.refreshViewer()
+    this.syncReplContext()
     this.renderAllVisibleEditors()
   }
 
@@ -400,7 +405,30 @@ class GhostLogController {
     this.entryOrder.push(entry)
     this.currentDiff = undefined
     this.refreshViewer()
+    this.syncReplContext()
     this.renderEditorForFile(filePath)
+  }
+
+  private syncReplContext(): void {
+    const recentEntries = this.entryOrder
+      .filter((entry) => entry.kind !== 'network' && entry.kind !== 'timing')
+      .slice(-25)
+      .reverse()
+    const values: Array<{ key: string; raw: string }> = []
+
+    for (const [index, entry] of recentEntries.entries()) {
+      const rawValue =
+        entry.values.length <= 1 ? (entry.values[0] ?? entry.raw) : `[${entry.values.join(', ')}]`
+      values.push({ key: this.toReplKey(entry, index), raw: rawValue })
+    }
+
+    this.replPanel.updateCapturedValues(values)
+  }
+
+  private toReplKey(entry: LogEntry, index: number): string {
+    const fileName = entry.file ? path.basename(entry.file).replace(/[^A-Za-z0-9_$]/g, '_') : 'unknown'
+    const line = typeof entry.line === 'number' ? entry.line + 1 : index
+    return `$${fileName}_${line}`
   }
 
   private getEntriesForLine(filePath: string, line: number): LogEntry[] {

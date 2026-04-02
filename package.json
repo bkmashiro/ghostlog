@@ -17,6 +17,7 @@
     "onLanguage:typescript",
     "onLanguage:typescriptreact",
     "onView:ghostlog.logViewer",
+    "onView:ghostlog.repl",
     "onCommand:ghostlog.addLogpoint",
     "onCommand:ghostlog.snapshotLogs",
     "onCommand:ghostlog.diffLogs",
@@ -73,6 +74,11 @@
         {
           "id": "ghostlog.logViewer",
           "name": "Log Viewer",
+          "type": "webview"
+        },
+        {
+          "id": "ghostlog.repl",
+          "name": "REPL",
           "type": "webview"
         }
       ]
