@@ -12,7 +12,7 @@ export interface ReplResult {
   timestamp: number
 }
 
-function reviveCapturedValue(value: string): unknown {
+export function reviveCapturedValue(value: string): unknown {
   const trimmed = value.trim()
   if (!trimmed) {
     return ''

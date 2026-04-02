@@ -1,10 +1,18 @@
 import * as vscode from 'vscode'
+import type { PinnedPath } from './pin.js'
 import { GhostlogRepl, formatValue } from './repl.js'
+
+export interface ReplPanelActions {
+  removePin: (id: string) => void
+}
 
 export class ReplPanelProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'ghostlog.repl'
   private readonly repl = new GhostlogRepl()
   private view?: vscode.WebviewView
+  private pins: PinnedPath[] = []
+
+  constructor(private readonly actions: ReplPanelActions) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView
@@ -18,6 +26,8 @@ export class ReplPanelProvider implements vscode.WebviewViewProvider {
       } else if (message.type === 'clear') {
         this.repl.clearHistory()
         void this.postState()
+      } else if (message.type === 'removePin' && typeof message.id === 'string') {
+        this.actions.removePin(message.id)
       }
     })
 
@@ -34,6 +44,11 @@ export class ReplPanelProvider implements vscode.WebviewViewProvider {
     void this.postState()
   }
 
+  updatePins(pins: PinnedPath[]): void {
+    this.pins = pins
+    void this.postState()
+  }
+
   private async postState(): Promise<void> {
     if (!this.view) {
       return
@@ -43,7 +58,18 @@ export class ReplPanelProvider implements vscode.WebviewViewProvider {
       type: 'state',
       summary: this.buildContextSummary(context),
       variables: this.buildVariableList(context),
-      history: this.repl.getHistory()
+      history: this.repl.getHistory(),
+      pins: this.pins.map((pin) => ({
+        id: pin.id,
+        file: pin.file,
+        line: pin.line,
+        path: pin.path,
+        history: pin.history.map((entry) => ({
+          ...entry,
+          time: new Date(entry.timestamp).toLocaleTimeString(),
+          value: formatValue(entry.value, 2)
+        }))
+      }))
     })
   }
 
@@ -90,10 +116,19 @@ export class ReplPanelProvider implements vscode.WebviewViewProvider {
       margin: 0;
       padding: 8px;
     }
-    .context {
+    .section {
       border-bottom: 1px solid var(--vscode-panel-border);
       margin-bottom: 8px;
       padding-bottom: 8px;
+    }
+    .section-title {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+      opacity: 0.75;
+      text-transform: uppercase;
+    }
+    .context {
       white-space: pre-wrap;
       opacity: 0.85;
     }
@@ -103,16 +138,44 @@ export class ReplPanelProvider implements vscode.WebviewViewProvider {
       margin-top: 6px;
       word-break: break-word;
     }
-    .history {
+    .pins, .history {
       display: flex;
       flex-direction: column;
       gap: 8px;
-      max-height: calc(100vh - 140px);
-      overflow-y: auto;
     }
-    .entry {
-      border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 65%, transparent);
-      padding-bottom: 8px;
+    .pin, .entry {
+      border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 65%, transparent);
+      border-radius: 6px;
+      padding: 8px;
+    }
+    .pin-head {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .pin-path {
+      font-family: var(--vscode-editor-font-family);
+      word-break: break-word;
+    }
+    .pin-location {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+    .pin-history {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .pin-item {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: auto 1fr auto;
+    }
+    .pin-item.changed {
+      color: var(--vscode-terminal-ansiYellow);
     }
     .prompt {
       color: var(--vscode-terminal-ansiGreen);
@@ -167,9 +230,19 @@ export class ReplPanelProvider implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
-  <div class="context" id="context">No values captured yet</div>
-  <div class="context-vars" id="vars">$0, $1, $last</div>
-  <div class="history" id="history"></div>
+  <div class="section">
+    <div class="section-title">Context</div>
+    <div class="context" id="context">No values captured yet</div>
+    <div class="context-vars" id="vars"></div>
+  </div>
+  <div class="section">
+    <div class="section-title">Pinned Paths</div>
+    <div class="pins" id="pins"></div>
+  </div>
+  <div class="section">
+    <div class="section-title">REPL History</div>
+    <div class="history" id="history"></div>
+  </div>
   <div class="input-row">
     <span class="input-prompt">&gt;</span>
     <input type="text" id="input" placeholder="$0?.value, $last, JSON.stringify($1)" autofocus />
@@ -181,6 +254,7 @@ export class ReplPanelProvider implements vscode.WebviewViewProvider {
     const historyEl = document.getElementById('history');
     const contextEl = document.getElementById('context');
     const varsEl = document.getElementById('vars');
+    const pinsEl = document.getElementById('pins');
     const commandHistory = [];
     let historyIndex = -1;
 
@@ -210,26 +284,59 @@ export class ReplPanelProvider implements vscode.WebviewViewProvider {
       if (data.type === 'state') {
         contextEl.textContent = data.summary;
         varsEl.textContent = data.variables.length ? 'Available: ' + data.variables.join(', ') : '';
+        renderPins(data.pins);
         renderHistory(data.history);
       }
     });
 
-    function renderHistory(results) {
-      historyEl.innerHTML = '';
-      for (const result of results) {
-        appendResult(result);
+    function renderPins(pins) {
+      pinsEl.innerHTML = '';
+      if (!pins.length) {
+        pinsEl.innerHTML = '<div class="pin">(waiting for pinned paths)</div>';
+        return;
+      }
+
+      for (const pin of pins) {
+        const div = document.createElement('div');
+        div.className = 'pin';
+        div.innerHTML =
+          '<div class="pin-head">' +
+            '<div class="pin-path">' + escapeHtml(pin.path) + '</div>' +
+            '<button type="button" data-remove-pin="' + escapeHtml(pin.id) + '">remove</button>' +
+          '</div>' +
+          '<div class="pin-location">' + escapeHtml(pin.file + ':' + (pin.line + 1)) + '</div>' +
+          '<div class="pin-history">' +
+            (pin.history.length
+              ? pin.history.map((entry) =>
+                  '<div class="pin-item ' + (entry.changed ? 'changed' : '') + '">' +
+                    '<span>' + escapeHtml(entry.time) + '</span>' +
+                    '<span>' + escapeHtml(entry.value) + '</span>' +
+                    '<span>' + (entry.changed ? 'changed' : '') + '</span>' +
+                  '</div>'
+                ).join('')
+              : '<div>(waiting for updates...)</div>') +
+          '</div>';
+        pinsEl.appendChild(div);
+      }
+
+      for (const button of pinsEl.querySelectorAll('[data-remove-pin]')) {
+        button.addEventListener('click', () => {
+          vscode.postMessage({ type: 'removePin', id: button.dataset.removePin });
+        });
       }
     }
 
-    function appendResult(result) {
-      const div = document.createElement('div');
-      div.className = 'entry';
-      div.innerHTML = '<div class="prompt">&gt; ' + escapeHtml(result.input) + '</div>' +
-        (result.error
-          ? '<div class="error">✗ ' + escapeHtml(result.error) + '</div>'
-          : '<div class="result">← ' + escapeHtml(result.output) + '</div>');
-      historyEl.appendChild(div);
-      historyEl.scrollTop = historyEl.scrollHeight;
+    function renderHistory(results) {
+      historyEl.innerHTML = '';
+      for (const result of results) {
+        const div = document.createElement('div');
+        div.className = 'entry';
+        div.innerHTML = '<div class="prompt">&gt; ' + escapeHtml(result.input) + '</div>' +
+          (result.error
+            ? '<div class="error">✗ ' + escapeHtml(result.error) + '</div>'
+            : '<div class="result">← ' + escapeHtml(result.output) + '</div>');
+        historyEl.appendChild(div);
+      }
     }
 
     function escapeHtml(value) {

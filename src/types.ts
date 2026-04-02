@@ -41,4 +41,12 @@ export interface LogEntry {
   }
   logpointId?: string
   expression?: string
+  parsedValue?: unknown
+  patternSignature?: string
+  lens?: {
+    expression: string
+    label?: string
+    result: unknown
+    error?: string
+  }
 }

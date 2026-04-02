@@ -1,3 +1,4 @@
+import { classifyEntries, summarizePatterns } from './classifier.js'
 import type { LogEntry, NetworkEntry } from './types.js'
 
 export interface LogLocation {
@@ -227,4 +228,24 @@ export function matchNetworkToLocation(
     })
 
   return ranked[0]?.location ?? null
+}
+
+export function summarizeEntryPatterns(entries: LogEntry[]): string | undefined {
+  if (entries.length < 10) {
+    return undefined
+  }
+
+  const values = entries
+    .map((entry) => entry.parsedValue)
+    .filter((value) => value !== undefined)
+  if (values.length < 10) {
+    return undefined
+  }
+
+  const patterns = classifyEntries(values)
+  if (patterns.size <= 1) {
+    return undefined
+  }
+
+  return summarizePatterns(patterns)
 }

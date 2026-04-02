@@ -34,8 +34,193 @@ __export(extension_exports, {
   deactivate: () => deactivate
 });
 module.exports = __toCommonJS(extension_exports);
-var import_node_path2 = __toESM(require("node:path"));
+var import_node_path3 = __toESM(require("node:path"));
 var vscode4 = __toESM(require("vscode"));
+
+// src/classifier.ts
+function isPlainObject(value) {
+  return Object.prototype.toString.call(value) === "[object Object]";
+}
+function detectPattern(value) {
+  if (value === null) {
+    return "null";
+  }
+  const type = typeof value;
+  if (type !== "object") {
+    return type;
+  }
+  if (Array.isArray(value)) {
+    return "Array";
+  }
+  const constructorName = value.constructor?.name?.trim() ?? "";
+  if (constructorName && constructorName !== "Object") {
+    return constructorName;
+  }
+  if (isPlainObject(value)) {
+    const keys = Object.keys(value).sort();
+    return `{${keys.join(",")}}`;
+  }
+  return "object";
+}
+function classifyEntries(entries) {
+  const patterns = /* @__PURE__ */ new Map();
+  for (const value of entries) {
+    const signature = detectPattern(value);
+    const now = Date.now();
+    const current = patterns.get(signature);
+    if (current) {
+      current.count += 1;
+      current.lastSeen = now;
+      if (current.examples.length < 3) {
+        current.examples.push(value);
+      }
+      continue;
+    }
+    patterns.set(signature, {
+      signature,
+      count: 1,
+      examples: [value],
+      firstSeen: now,
+      lastSeen: now
+    });
+  }
+  return patterns;
+}
+function summarizePatterns(patterns) {
+  const ordered = [...patterns.values()].sort((left, right) => right.count - left.count);
+  if (ordered.length === 0) {
+    return "";
+  }
+  const summary = ordered.map((pattern) => `${pattern.signature}\xD7${pattern.count}`).join(", ");
+  if (ordered.length === 1) {
+    return summary;
+  }
+  return `[${ordered.length} patterns] ${summary}`;
+}
+
+// src/lens.ts
+var import_node_fs = __toESM(require("node:fs"));
+var import_node_path = __toESM(require("node:path"));
+var vm = __toESM(require("node:vm"));
+function ensureStorageDir(workspaceRoot) {
+  const dir = import_node_path.default.join(workspaceRoot, ".ghostlog");
+  import_node_fs.default.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+function getStoragePath(workspaceRoot) {
+  return import_node_path.default.join(ensureStorageDir(workspaceRoot), "lenses.json");
+}
+var LensStore = class {
+  lenses = /* @__PURE__ */ new Map();
+  load(workspaceRoot) {
+    const storagePath = getStoragePath(workspaceRoot);
+    if (!import_node_fs.default.existsSync(storagePath)) {
+      this.lenses.clear();
+      return;
+    }
+    try {
+      const raw = import_node_fs.default.readFileSync(storagePath, "utf8");
+      const parsed = JSON.parse(raw);
+      this.lenses = new Map(parsed.map((lens) => [lens.id, lens]));
+    } catch {
+      this.lenses.clear();
+    }
+  }
+  save(workspaceRoot) {
+    const storagePath = getStoragePath(workspaceRoot);
+    import_node_fs.default.writeFileSync(storagePath, JSON.stringify(this.list(), null, 2));
+  }
+  add(file, line, expression, label) {
+    const lens = {
+      id: `${file}:${line}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      file,
+      line,
+      expression,
+      enabled: true,
+      label
+    };
+    this.lenses.set(lens.id, lens);
+    return lens;
+  }
+  remove(id) {
+    this.lenses.delete(id);
+  }
+  update(id, expression, label) {
+    const lens = this.lenses.get(id);
+    if (!lens) {
+      return void 0;
+    }
+    lens.expression = expression;
+    lens.label = label;
+    return lens;
+  }
+  getForLine(file, line) {
+    return this.list().find((lens) => lens.file === file && lens.line === line);
+  }
+  list() {
+    return [...this.lenses.values()].sort((left, right) => {
+      if (left.file !== right.file) {
+        return left.file.localeCompare(right.file);
+      }
+      if (left.line !== right.line) {
+        return left.line - right.line;
+      }
+      return left.id.localeCompare(right.id);
+    });
+  }
+  toggle(id) {
+    const lens = this.lenses.get(id);
+    if (!lens) {
+      return;
+    }
+    lens.enabled = !lens.enabled;
+  }
+};
+function normalizeExpression(expression) {
+  const trimmed = expression.trim();
+  if (!trimmed) {
+    return "x";
+  }
+  if (trimmed.startsWith(".")) {
+    return `x${trimmed}`;
+  }
+  return trimmed;
+}
+function applyLens(value, expression) {
+  const normalized = normalizeExpression(expression);
+  const sandbox = /* @__PURE__ */ Object.create(null);
+  sandbox.x = value;
+  sandbox.$ = value;
+  sandbox.$0 = value;
+  sandbox.JSON = JSON;
+  sandbox.Math = Math;
+  sandbox.Array = Array;
+  sandbox.Object = Object;
+  sandbox.String = String;
+  sandbox.Number = Number;
+  sandbox.Boolean = Boolean;
+  sandbox.Date = Date;
+  sandbox.RegExp = RegExp;
+  try {
+    const isArrow = normalized.includes("=>");
+    const result = vm.runInNewContext(
+      isArrow ? `(${normalized})(x)` : normalized,
+      sandbox,
+      { timeout: 100 }
+    );
+    return { result };
+  } catch (error) {
+    try {
+      const result = vm.runInNewContext(`(() => { ${normalized} })()`, sandbox, { timeout: 100 });
+      return { result };
+    } catch (nestedError) {
+      return {
+        result: void 0,
+        error: nestedError instanceof Error ? nestedError.message : String(nestedError)
+      };
+    }
+  }
+}
 
 // src/commands.ts
 var vscode = __toESM(require("vscode"));
@@ -45,11 +230,16 @@ function registerCommands(handlers) {
     vscode.commands.registerCommand("ghostlog.toggle", handlers.toggle),
     vscode.commands.registerCommand("ghostlog.clearFile", handlers.clearFile),
     vscode.commands.registerCommand("ghostlog.addLogpoint", handlers.addLogpoint),
+    vscode.commands.registerCommand("ghostlog.addLens", handlers.addLens),
+    vscode.commands.registerCommand("ghostlog.editLens", handlers.editLens),
+    vscode.commands.registerCommand("ghostlog.removeLens", handlers.removeLens),
+    vscode.commands.registerCommand("ghostlog.pinPath", handlers.pinPath),
     vscode.commands.registerCommand("ghostlog.snapshotLogs", handlers.snapshotLogs),
     vscode.commands.registerCommand("ghostlog.diffLogs", handlers.diffLogs),
     vscode.commands.registerCommand("ghostlog.startMcp", handlers.startMcp),
     vscode.commands.registerCommand("ghostlog.stopMcp", handlers.stopMcp),
-    vscode.commands.registerCommand("ghostlog.focusLogViewer", handlers.focusLogViewer)
+    vscode.commands.registerCommand("ghostlog.focusLogViewer", handlers.focusLogViewer),
+    vscode.commands.registerCommand("ghostlog.focusLineInViewer", handlers.focusLineInViewer)
   ];
 }
 
@@ -265,8 +455,144 @@ function classifyDuration(ms) {
   return "slow";
 }
 
+// src/repl.ts
+var vm2 = __toESM(require("node:vm"));
+function reviveCapturedValue(value) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed === "undefined") {
+    return void 0;
+  }
+  if (trimmed === "null") {
+    return null;
+  }
+  if (trimmed === "true") {
+    return true;
+  }
+  if (trimmed === "false") {
+    return false;
+  }
+  if (/^-?(?:\d+|\d*\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed)) {
+    return Number(trimmed);
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+  }
+  try {
+    return vm2.runInNewContext(`(${trimmed})`, /* @__PURE__ */ Object.create(null), { timeout: 50 });
+  } catch {
+    return trimmed;
+  }
+}
+var GhostlogRepl = class {
+  context = { $last: void 0 };
+  history = [];
+  updateContext(entries) {
+    const nextContext = { $last: void 0 };
+    let index = 0;
+    for (const [key, value] of entries) {
+      nextContext[`$${index}`] = value;
+      nextContext[key] = value;
+      nextContext.$last = value;
+      index += 1;
+    }
+    this.context = nextContext;
+  }
+  updateFromCaptured(values) {
+    const entries = /* @__PURE__ */ new Map();
+    for (const value of values) {
+      entries.set(value.key, reviveCapturedValue(value.raw));
+    }
+    this.updateContext(entries);
+  }
+  evaluate(expression) {
+    try {
+      const sandbox = {
+        ...this.context,
+        JSON,
+        Math,
+        Array,
+        Object,
+        String,
+        Number,
+        Boolean,
+        Date,
+        RegExp
+      };
+      const result = vm2.runInNewContext(expression, sandbox, { timeout: 1e3 });
+      const entry = {
+        input: expression,
+        output: formatValue(result),
+        timestamp: Date.now()
+      };
+      this.history.push(entry);
+      return entry;
+    } catch (error) {
+      const entry = {
+        input: expression,
+        output: "",
+        error: String(error),
+        timestamp: Date.now()
+      };
+      this.history.push(entry);
+      return entry;
+    }
+  }
+  getHistory() {
+    return [...this.history];
+  }
+  clearHistory() {
+    this.history = [];
+  }
+  getContext() {
+    return { ...this.context };
+  }
+};
+function formatValue(value, maxDepth = 3) {
+  if (value === void 0) {
+    return "undefined";
+  }
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return "[]";
+    }
+    if (maxDepth <= 0) {
+      return `[ ...${value.length} items ]`;
+    }
+    if (value.length > 10) {
+      return `[ ...${value.length} items ]`;
+    }
+    const preview = value.slice(0, 5).map((entry) => formatValue(entry, maxDepth - 1)).join(", ");
+    return `[ ${preview}${value.length > 5 ? ", ..." : ""} ]`;
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value);
+    if (keys.length === 0) {
+      return "{}";
+    }
+    if (maxDepth <= 0) {
+      return `{ ...${keys.length} keys }`;
+    }
+    const preview = keys.slice(0, 4).map((key) => `${key}: ${formatValue(value[key], maxDepth - 1)}`).join(", ");
+    return `{ ${preview}${keys.length > 4 ? ", ..." : ""} }`;
+  }
+  return String(value);
+}
+
 // src/decorator.ts
-function buildDecorationText(entries) {
+function buildDecorationText(entries, options) {
   if (entries.length === 0) {
     return "";
   }
@@ -285,6 +611,14 @@ function buildDecorationText(entries) {
   }
   const highestLevel = entries.find((entry) => entry.level === "error")?.level ?? entries.find((entry) => entry.level === "warn")?.level ?? entries[0].level;
   const prefix = highestLevel === "error" ? "\u26A0" : highestLevel === "warn" ? "\u{1F47B} !" : "\u{1F47B}";
+  const latestLens = entries.at(-1)?.lens;
+  if (latestLens) {
+    const rendered = latestLens.error ? `Error: ${latestLens.error}` : formatValue(latestLens.result, 2);
+    return `${prefix} (lens: ${latestLens.label ?? latestLens.expression}) \u2192 ${rendered}`;
+  }
+  if (options?.patternSummary) {
+    return `${prefix} ${options.patternSummary}`;
+  }
   const text = groupEntries(entries);
   return text ? `${prefix} ${text}` : prefix;
 }
@@ -507,6 +841,8 @@ var LogViewerProvider = class {
   view;
   entries = [];
   diff;
+  pins = [];
+  focusedLine;
   resolveWebviewView(view) {
     this.view = view;
     view.webview.options = { enableScripts: true };
@@ -517,38 +853,93 @@ var LogViewerProvider = class {
         void this.actions.exportAll();
       } else if (message.type === "open" && typeof message.entryId === "string") {
         this.actions.openEntry(message.entryId);
+      } else if (message.type === "pin" && typeof message.file === "string" && typeof message.line === "number" && typeof message.path === "string") {
+        this.actions.pinPath(message.file, message.line, message.path);
+      } else if (message.type === "removePin" && typeof message.id === "string") {
+        this.actions.removePin(message.id);
+      } else if (message.type === "focusLine" && typeof message.file === "string" && typeof message.line === "number") {
+        this.actions.focusLine(message.file, message.line);
       }
     });
     this.render();
   }
-  update(entries, diff) {
+  update(entries, diff, pins = []) {
     this.entries = [...entries];
     this.diff = diff;
+    this.pins = [...pins];
+    this.render();
+  }
+  setFocusedLine(file, line) {
+    this.focusedLine = { file, line };
     this.render();
   }
   render() {
     if (!this.view) {
       return;
     }
+    const focus = this.focusedLine ?? this.getLatestLine();
+    const focusEntries = focus ? this.entries.filter((entry) => entry.file === focus.file && entry.line === focus.line) : [];
+    const focusPatterns = classifyEntries(
+      focusEntries.map((entry) => entry.parsedValue).filter((value) => value !== void 0)
+    );
+    const maxPatternCount = Math.max(...[...focusPatterns.values()].map((pattern) => pattern.count), 1);
+    const latestFocusedEntry = focusEntries.at(-1);
+    const diffBanner = this.diff ? `<div class="diff">Diff mode: +${this.diff.added.length} / -${this.diff.removed.length} / ~${this.diff.changed.length}</div>` : "";
+    const focusBanner = focus ? `<div class="focus">Focused line: ${escapeHtml(
+      `${vscode3.workspace.asRelativePath(focus.file)}:${focus.line + 1}`
+    )}</div>` : '<div class="focus">Focused line: none</div>';
     const rows = this.entries.map((entry, index) => {
       const id = `${index}:${entry.file ?? ""}:${entry.line ?? -1}:${entry.timestamp}`;
       const value = escapeHtml(
-        entry.kind === "network" ? entry.network ? `${entry.network.method} ${entry.network.status ?? "ERR"} ${entry.network.duration}ms ${entry.network.url}` : entry.raw : entry.values.join(" ") || entry.raw
+        entry.kind === "network" ? entry.network ? `${entry.network.method} ${entry.network.status ?? "ERR"} ${entry.network.duration}ms ${entry.network.url}` : entry.raw : entry.lens ? formatValue(entry.lens.result, 2) : entry.values.join(" ") || entry.raw
       );
-      const fileLine = escapeHtml(
-        `${entry.file ? vscode3.workspace.asRelativePath(entry.file) : "unknown"}:${(entry.line ?? 0) + 1}`
-      );
+      const file = entry.file ?? "unknown";
+      const line = entry.line ?? -1;
+      const signature = escapeHtml(entry.patternSignature ?? "");
+      const fileLine = escapeHtml(`${vscode3.workspace.asRelativePath(file)}:${line + 1}`);
       const time = escapeHtml(new Date(entry.timestamp).toLocaleTimeString());
       const level = escapeHtml(entry.level.toUpperCase());
       const rowClass = entry.level;
-      return `<tr class="row ${rowClass}" data-entry-id="${id}">
+      const isFocused = focus ? file === focus.file && line === focus.line : false;
+      return `<tr class="row ${rowClass} ${isFocused ? "focused-row" : ""}" data-entry-id="${id}" data-pattern="${signature}" data-file="${escapeHtml(file)}" data-line="${line}">
           <td>${time}</td>
           <td>${fileLine}</td>
           <td>${level}</td>
           <td title="${value}">${value}</td>
+          <td class="actions">
+            <button type="button" data-focus="${escapeHtml(file)}:${line}">focus</button>
+            <button type="button" data-open-entry="${id}">open</button>
+          </td>
         </tr>`;
     }).join("");
-    const diffBanner = this.diff ? `<div class="diff">Diff mode: +${this.diff.added.length} / -${this.diff.removed.length} / ~${this.diff.changed.length}</div>` : "";
+    const patternsMarkup = focusPatterns.size ? [...focusPatterns.values()].sort((left, right) => right.count - left.count).map((pattern) => {
+      const width = `${Math.max(8, Math.round(pattern.count / maxPatternCount * 100))}%`;
+      const examples = escapeHtml(pattern.examples.map((example) => formatValue(example, 1)).join(" | "));
+      return `<button class="pattern" type="button" data-pattern-filter="${escapeHtml(pattern.signature)}">
+              <div class="pattern-head">
+                <strong>${escapeHtml(pattern.signature)}</strong>
+                <span>${pattern.count}</span>
+              </div>
+              <div class="histogram"><span style="width:${width}"></span></div>
+              <div class="pattern-example" title="${examples}">${examples}</div>
+            </button>`;
+    }).join("") : '<div class="empty">No pattern data for this line yet.</div>';
+    const pinsMarkup = this.pins.length ? this.pins.map((pin) => {
+      const history = pin.history.length ? pin.history.map((entry) => {
+        const value = escapeHtml(formatValue(entry.value, 2));
+        const time = escapeHtml(new Date(entry.timestamp).toLocaleTimeString());
+        return `<div class="pin-history-item ${entry.changed ? "changed" : ""}"><span>${time}</span><span>${value}</span></div>`;
+      }).join("") : '<div class="empty">(waiting for updates...)</div>';
+      return `<div class="pin-card">
+              <div class="pin-head">
+                <strong>${escapeHtml(pin.path)}</strong>
+                <button type="button" data-remove-pin="${escapeHtml(pin.id)}">remove</button>
+              </div>
+              <div class="pin-meta">${escapeHtml(`${vscode3.workspace.asRelativePath(pin.file)}:${pin.line + 1}`)}</div>
+              ${history}
+            </div>`;
+    }).join("") : '<div class="empty">No pinned paths yet.</div>';
+    const detailMarkup = focus && latestFocusedEntry?.parsedValue !== void 0 ? this.renderPinnedValueTree(latestFocusedEntry.parsedValue, focus.file, focus.line) : '<div class="empty">Select a structured value to browse pin paths.</div>';
     this.view.webview.html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -557,15 +948,43 @@ var LogViewerProvider = class {
     :root { color-scheme: light dark; }
     body { font-family: var(--vscode-font-family); margin: 0; padding: 12px; }
     .toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
+    .banner { display: grid; gap: 6px; margin-bottom: 12px; }
+    .focus, .diff { font-size: 12px; opacity: 0.85; }
+    .layout { display: grid; gap: 12px; }
+    .panel { border: 1px solid var(--vscode-panel-border); border-radius: 8px; padding: 10px; }
+    .panel h3 { font-size: 12px; letter-spacing: 0.08em; margin: 0 0 8px; text-transform: uppercase; }
     input { flex: 1; padding: 6px; }
-    button { padding: 6px 10px; }
+    button { padding: 4px 8px; }
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    th, td { text-align: left; padding: 6px; border-bottom: 1px solid var(--vscode-panel-border); }
-    .row { cursor: pointer; }
+    th, td { text-align: left; padding: 6px; border-bottom: 1px solid var(--vscode-panel-border); vertical-align: top; }
+    .row { cursor: default; }
+    .row button { margin-right: 6px; }
+    .focused-row { background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 18%, transparent); }
     .log td:nth-child(3) { color: #4c8dff; }
     .warn td:nth-child(3) { color: #d2a73b; }
     .error td:nth-child(3) { color: #dc5b5b; }
-    .diff { margin-bottom: 8px; font-size: 12px; opacity: 0.85; }
+    .actions { white-space: nowrap; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 10px; }
+    .tab { opacity: 0.7; }
+    .tab.active { opacity: 1; }
+    .tab-panel.hidden { display: none; }
+    .patterns { display: grid; gap: 8px; }
+    .pattern { background: transparent; border: 1px solid var(--vscode-panel-border); border-radius: 8px; display: grid; gap: 6px; padding: 8px; text-align: left; width: 100%; }
+    .pattern-head { align-items: center; display: flex; justify-content: space-between; }
+    .histogram { background: color-mix(in srgb, var(--vscode-panel-border) 50%, transparent); border-radius: 999px; height: 8px; overflow: hidden; }
+    .histogram span { background: var(--vscode-terminal-ansiBlue); display: block; height: 100%; }
+    .pattern-example { font-size: 11px; opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pin-grid { display: grid; gap: 8px; }
+    .pin-card { border: 1px solid var(--vscode-panel-border); border-radius: 8px; padding: 8px; }
+    .pin-head { align-items: center; display: flex; justify-content: space-between; gap: 8px; }
+    .pin-meta { font-size: 11px; margin: 6px 0; opacity: 0.75; }
+    .pin-history-item { display: grid; gap: 8px; grid-template-columns: auto 1fr; }
+    .pin-history-item.changed { color: var(--vscode-terminal-ansiYellow); }
+    .tree { display: grid; gap: 4px; }
+    .tree-row { align-items: center; display: grid; gap: 8px; grid-template-columns: 1fr auto auto; margin-left: var(--indent, 0px); }
+    .tree-path { font-family: var(--vscode-editor-font-family); word-break: break-word; }
+    .tree-value { opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .empty { font-size: 12px; opacity: 0.75; }
   </style>
 </head>
 <body>
@@ -574,33 +993,135 @@ var LogViewerProvider = class {
     <button id="clear">Clear All</button>
     <button id="export">Export</button>
   </div>
-  ${diffBanner}
-  <table>
-    <thead>
-      <tr><th>Time</th><th>File:Line</th><th>Level</th><th>Value</th></tr>
-    </thead>
-    <tbody id="rows">${rows}</tbody>
-  </table>
+  <div class="banner">
+    ${focusBanner}
+    ${diffBanner}
+  </div>
+  <div class="layout">
+    <div class="panel">
+      <h3>Entries</h3>
+      <table>
+        <thead>
+          <tr><th>Time</th><th>File:Line</th><th>Level</th><th>Value</th><th></th></tr>
+        </thead>
+        <tbody id="rows">${rows}</tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <div class="tabs">
+        <button class="tab active" data-tab="patterns" type="button">Patterns</button>
+        <button class="tab" data-tab="pins" type="button">Pins</button>
+        <button class="tab" data-tab="paths" type="button">Paths</button>
+      </div>
+      <div class="tab-panel" data-panel="patterns">
+        <div class="patterns">${patternsMarkup}</div>
+      </div>
+      <div class="tab-panel hidden" data-panel="pins">
+        <div class="pin-grid">${pinsMarkup}</div>
+      </div>
+      <div class="tab-panel hidden" data-panel="paths">
+        <div class="tree">${detailMarkup}</div>
+      </div>
+    </div>
+  </div>
   <script>
     const vscode = acquireVsCodeApi();
     const filter = document.getElementById('filter');
     const rows = Array.from(document.querySelectorAll('.row'));
-    filter.addEventListener('input', () => {
-      const query = filter.value.toLowerCase();
-      for (const row of rows) {
-        row.style.display = row.textContent.toLowerCase().includes(query) ? '' : 'none';
-      }
-    });
+    let patternFilter = '';
+
+    filter.addEventListener('input', applyFilters);
     document.getElementById('clear').addEventListener('click', () => vscode.postMessage({ type: 'clear' }));
     document.getElementById('export').addEventListener('click', () => vscode.postMessage({ type: 'export' }));
-    for (const row of rows) {
-      row.addEventListener('click', () => {
-        vscode.postMessage({ type: 'open', entryId: row.dataset.entryId });
+
+    for (const button of document.querySelectorAll('[data-open-entry]')) {
+      button.addEventListener('click', () => vscode.postMessage({ type: 'open', entryId: button.dataset.openEntry }));
+    }
+    for (const button of document.querySelectorAll('[data-focus]')) {
+      button.addEventListener('click', () => {
+        const [file, line] = button.dataset.focus.split(':');
+        vscode.postMessage({ type: 'focusLine', file, line: Number(line) });
       });
+    }
+    for (const button of document.querySelectorAll('[data-pattern-filter]')) {
+      button.addEventListener('click', () => {
+        patternFilter = patternFilter === button.dataset.patternFilter ? '' : button.dataset.patternFilter;
+        applyFilters();
+      });
+    }
+    for (const button of document.querySelectorAll('[data-pin-path]')) {
+      button.addEventListener('click', () => {
+        vscode.postMessage({
+          type: 'pin',
+          file: button.dataset.file,
+          line: Number(button.dataset.line),
+          path: button.dataset.pinPath
+        });
+      });
+    }
+    for (const button of document.querySelectorAll('[data-remove-pin]')) {
+      button.addEventListener('click', () => vscode.postMessage({ type: 'removePin', id: button.dataset.removePin }));
+    }
+    for (const tab of document.querySelectorAll('[data-tab]')) {
+      tab.addEventListener('click', () => {
+        for (const current of document.querySelectorAll('[data-tab]')) {
+          current.classList.toggle('active', current === tab);
+        }
+        for (const panel of document.querySelectorAll('[data-panel]')) {
+          panel.classList.toggle('hidden', panel.dataset.panel !== tab.dataset.tab);
+        }
+      });
+    }
+
+    applyFilters();
+
+    function applyFilters() {
+      const query = filter.value.toLowerCase();
+      for (const row of rows) {
+        const matchesText = row.textContent.toLowerCase().includes(query);
+        const matchesPattern = !patternFilter || row.dataset.pattern === patternFilter;
+        row.style.display = matchesText && matchesPattern ? '' : 'none';
+      }
     }
   </script>
 </body>
 </html>`;
+  }
+  getLatestLine() {
+    for (let index = this.entries.length - 1; index >= 0; index -= 1) {
+      const entry = this.entries[index];
+      if (entry.file && typeof entry.line === "number") {
+        return { file: entry.file, line: entry.line };
+      }
+    }
+    return void 0;
+  }
+  renderPinnedValueTree(value, file, line, path4 = "", depth = 0) {
+    const rows = [];
+    const preview = escapeHtml(formatValue(value, 1));
+    if (path4) {
+      rows.push(
+        `<div class="tree-row" style="--indent:${depth * 14}px">
+          <span class="tree-path">${escapeHtml(path4)}</span>
+          <span class="tree-value">${preview}</span>
+          <button type="button" data-pin-path="${escapeHtml(path4)}" data-file="${escapeHtml(file)}" data-line="${line}">pin</button>
+        </div>`
+      );
+    }
+    if (Array.isArray(value)) {
+      value.slice(0, 8).forEach((entry, index) => {
+        const nextPath = path4 ? `${path4}[${index}]` : `[${index}]`;
+        rows.push(this.renderPinnedValueTree(entry, file, line, nextPath, depth + 1));
+      });
+      return rows.join("");
+    }
+    if (value && typeof value === "object") {
+      Object.entries(value).slice(0, 12).forEach(([key, entry]) => {
+        const nextPath = path4 ? `${path4}.${key}` : key;
+        rows.push(this.renderPinnedValueTree(entry, file, line, nextPath, depth + 1));
+      });
+    }
+    return rows.join("");
   }
 };
 function escapeHtml(value) {
@@ -608,8 +1129,8 @@ function escapeHtml(value) {
 }
 
 // src/logpoint.ts
-var import_node_fs = __toESM(require("node:fs"));
-var import_node_path = __toESM(require("node:path"));
+var import_node_fs2 = __toESM(require("node:fs"));
+var import_node_path2 = __toESM(require("node:path"));
 var LogpointManager = class {
   constructor(storagePath) {
     this.storagePath = storagePath;
@@ -640,14 +1161,14 @@ var LogpointManager = class {
     return this.logpoints.filter((logpoint) => logpoint.file === file);
   }
   ensureStorage() {
-    import_node_fs.default.mkdirSync(import_node_path.default.dirname(this.storagePath), { recursive: true });
-    if (!import_node_fs.default.existsSync(this.storagePath)) {
-      import_node_fs.default.writeFileSync(this.storagePath, "[]", "utf8");
+    import_node_fs2.default.mkdirSync(import_node_path2.default.dirname(this.storagePath), { recursive: true });
+    if (!import_node_fs2.default.existsSync(this.storagePath)) {
+      import_node_fs2.default.writeFileSync(this.storagePath, "[]", "utf8");
     }
   }
   read() {
     try {
-      const content = import_node_fs.default.readFileSync(this.storagePath, "utf8");
+      const content = import_node_fs2.default.readFileSync(this.storagePath, "utf8");
       const parsed = JSON.parse(content);
       return Array.isArray(parsed) ? parsed : [];
     } catch {
@@ -655,7 +1176,7 @@ var LogpointManager = class {
     }
   }
   write() {
-    import_node_fs.default.writeFileSync(this.storagePath, JSON.stringify(this.logpoints, null, 2), "utf8");
+    import_node_fs2.default.writeFileSync(this.storagePath, JSON.stringify(this.logpoints, null, 2), "utf8");
   }
 };
 
@@ -717,147 +1238,105 @@ function handleMethod(method, params, dataSource) {
   }
 }
 
-// src/repl.ts
-var vm = __toESM(require("node:vm"));
-function reviveCapturedValue(value) {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return "";
+// src/pin.ts
+function tokenizePath(path4) {
+  const tokens = [];
+  const pattern = /([^[.\]]+)|\[(\d+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\]/g;
+  for (const match of path4.matchAll(pattern)) {
+    const bare = match[1];
+    const bracket = match[2];
+    if (bare) {
+      tokens.push(bare);
+      continue;
+    }
+    if (!bracket) {
+      continue;
+    }
+    if (/^\d+$/.test(bracket)) {
+      tokens.push(bracket);
+      continue;
+    }
+    tokens.push(bracket.slice(1, -1));
   }
-  if (trimmed === "undefined") {
-    return void 0;
-  }
-  if (trimmed === "null") {
-    return null;
-  }
-  if (trimmed === "true") {
-    return true;
-  }
-  if (trimmed === "false") {
-    return false;
-  }
-  if (/^-?(?:\d+|\d*\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed)) {
-    return Number(trimmed);
-  }
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-  }
-  try {
-    return vm.runInNewContext(`(${trimmed})`, /* @__PURE__ */ Object.create(null), { timeout: 50 });
-  } catch {
-    return trimmed;
-  }
+  return tokens;
 }
-var GhostlogRepl = class {
-  context = { $last: void 0 };
-  history = [];
-  updateContext(entries) {
-    const nextContext = { $last: void 0 };
-    let index = 0;
-    for (const [key, value] of entries) {
-      nextContext[`$${index}`] = value;
-      nextContext[key] = value;
-      nextContext.$last = value;
-      index += 1;
+function isEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+function extractPath(obj, path4) {
+  const tokens = tokenizePath(path4);
+  let current = obj;
+  for (const token of tokens) {
+    if (current === null || current === void 0) {
+      return { value: void 0, found: false };
     }
-    this.context = nextContext;
-  }
-  updateFromCaptured(values) {
-    const entries = /* @__PURE__ */ new Map();
-    for (const value of values) {
-      entries.set(value.key, reviveCapturedValue(value.raw));
+    if (Array.isArray(current) && /^\d+$/.test(token)) {
+      const index = Number(token);
+      if (index >= current.length) {
+        return { value: void 0, found: false };
+      }
+      current = current[index];
+      continue;
     }
-    this.updateContext(entries);
-  }
-  evaluate(expression) {
-    try {
-      const sandbox = {
-        ...this.context,
-        JSON,
-        Math,
-        Array,
-        Object,
-        String,
-        Number,
-        Boolean,
-        Date,
-        RegExp
-      };
-      const result = vm.runInNewContext(expression, sandbox, { timeout: 1e3 });
-      const entry = {
-        input: expression,
-        output: formatValue(result),
-        timestamp: Date.now()
-      };
-      this.history.push(entry);
-      return entry;
-    } catch (error) {
-      const entry = {
-        input: expression,
-        output: "",
-        error: String(error),
-        timestamp: Date.now()
-      };
-      this.history.push(entry);
-      return entry;
+    if (typeof current === "object" && token in current) {
+      current = current[token];
+      continue;
     }
+    return { value: void 0, found: false };
   }
-  getHistory() {
-    return [...this.history];
+  return { value: current, found: true };
+}
+var PinStore = class {
+  pins = /* @__PURE__ */ new Map();
+  add(file, line, path4) {
+    const pin = {
+      id: `${file}:${line}:${path4}`,
+      file,
+      line,
+      path: path4,
+      history: [],
+      maxHistory: 50
+    };
+    this.pins.set(pin.id, pin);
+    return pin;
   }
-  clearHistory() {
-    this.history = [];
+  remove(id) {
+    this.pins.delete(id);
   }
-  getContext() {
-    return { ...this.context };
+  getForLine(file, line) {
+    return this.list().filter((pin) => pin.file === file && pin.line === line);
+  }
+  list() {
+    return [...this.pins.values()].sort((left, right) => left.id.localeCompare(right.id));
+  }
+  onNewValue(file, line, value) {
+    for (const pin of this.getForLine(file, line)) {
+      const extracted = extractPath(value, pin.path);
+      if (!extracted.found) {
+        continue;
+      }
+      const previous = pin.history.at(-1);
+      pin.history.push({
+        value: extracted.value,
+        timestamp: Date.now(),
+        changed: previous ? !isEqual(previous.value, extracted.value) : false
+      });
+      if (pin.history.length > pin.maxHistory) {
+        pin.history.splice(0, pin.history.length - pin.maxHistory);
+      }
+    }
   }
 };
-function formatValue(value, maxDepth = 3) {
-  if (value === void 0) {
-    return "undefined";
-  }
-  if (value === null) {
-    return "null";
-  }
-  if (typeof value === "string") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
-    return String(value);
-  }
-  if (Array.isArray(value)) {
-    if (value.length === 0) {
-      return "[]";
-    }
-    if (maxDepth <= 0) {
-      return `[ ...${value.length} items ]`;
-    }
-    if (value.length > 10) {
-      return `[ ...${value.length} items ]`;
-    }
-    const preview = value.slice(0, 5).map((entry) => formatValue(entry, maxDepth - 1)).join(", ");
-    return `[ ${preview}${value.length > 5 ? ", ..." : ""} ]`;
-  }
-  if (typeof value === "object") {
-    const keys = Object.keys(value);
-    if (keys.length === 0) {
-      return "{}";
-    }
-    if (maxDepth <= 0) {
-      return `{ ...${keys.length} keys }`;
-    }
-    const preview = keys.slice(0, 4).map((key) => `${key}: ${formatValue(value[key], maxDepth - 1)}`).join(", ");
-    return `{ ${preview}${keys.length > 4 ? ", ..." : ""} }`;
-  }
-  return String(value);
-}
 
 // src/repl-panel.ts
 var ReplPanelProvider = class {
+  constructor(actions) {
+    this.actions = actions;
+  }
   static viewType = "ghostlog.repl";
   repl = new GhostlogRepl();
   view;
+  pins = [];
   resolveWebviewView(webviewView) {
     this.view = webviewView;
     webviewView.webview.options = { enableScripts: true };
@@ -869,6 +1348,8 @@ var ReplPanelProvider = class {
       } else if (message.type === "clear") {
         this.repl.clearHistory();
         void this.postState();
+      } else if (message.type === "removePin" && typeof message.id === "string") {
+        this.actions.removePin(message.id);
       }
     });
     void this.postState();
@@ -881,6 +1362,10 @@ var ReplPanelProvider = class {
     this.repl.updateFromCaptured(values);
     void this.postState();
   }
+  updatePins(pins) {
+    this.pins = pins;
+    void this.postState();
+  }
   async postState() {
     if (!this.view) {
       return;
@@ -890,7 +1375,18 @@ var ReplPanelProvider = class {
       type: "state",
       summary: this.buildContextSummary(context),
       variables: this.buildVariableList(context),
-      history: this.repl.getHistory()
+      history: this.repl.getHistory(),
+      pins: this.pins.map((pin) => ({
+        id: pin.id,
+        file: pin.file,
+        line: pin.line,
+        path: pin.path,
+        history: pin.history.map((entry) => ({
+          ...entry,
+          time: new Date(entry.timestamp).toLocaleTimeString(),
+          value: formatValue(entry.value, 2)
+        }))
+      }))
     });
   }
   buildContextSummary(context) {
@@ -929,10 +1425,19 @@ var ReplPanelProvider = class {
       margin: 0;
       padding: 8px;
     }
-    .context {
+    .section {
       border-bottom: 1px solid var(--vscode-panel-border);
       margin-bottom: 8px;
       padding-bottom: 8px;
+    }
+    .section-title {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+      opacity: 0.75;
+      text-transform: uppercase;
+    }
+    .context {
       white-space: pre-wrap;
       opacity: 0.85;
     }
@@ -942,16 +1447,44 @@ var ReplPanelProvider = class {
       margin-top: 6px;
       word-break: break-word;
     }
-    .history {
+    .pins, .history {
       display: flex;
       flex-direction: column;
       gap: 8px;
-      max-height: calc(100vh - 140px);
-      overflow-y: auto;
     }
-    .entry {
-      border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 65%, transparent);
-      padding-bottom: 8px;
+    .pin, .entry {
+      border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 65%, transparent);
+      border-radius: 6px;
+      padding: 8px;
+    }
+    .pin-head {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .pin-path {
+      font-family: var(--vscode-editor-font-family);
+      word-break: break-word;
+    }
+    .pin-location {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+    .pin-history {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .pin-item {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: auto 1fr auto;
+    }
+    .pin-item.changed {
+      color: var(--vscode-terminal-ansiYellow);
     }
     .prompt {
       color: var(--vscode-terminal-ansiGreen);
@@ -1006,9 +1539,19 @@ var ReplPanelProvider = class {
   </style>
 </head>
 <body>
-  <div class="context" id="context">No values captured yet</div>
-  <div class="context-vars" id="vars">$0, $1, $last</div>
-  <div class="history" id="history"></div>
+  <div class="section">
+    <div class="section-title">Context</div>
+    <div class="context" id="context">No values captured yet</div>
+    <div class="context-vars" id="vars"></div>
+  </div>
+  <div class="section">
+    <div class="section-title">Pinned Paths</div>
+    <div class="pins" id="pins"></div>
+  </div>
+  <div class="section">
+    <div class="section-title">REPL History</div>
+    <div class="history" id="history"></div>
+  </div>
   <div class="input-row">
     <span class="input-prompt">&gt;</span>
     <input type="text" id="input" placeholder="$0?.value, $last, JSON.stringify($1)" autofocus />
@@ -1020,6 +1563,7 @@ var ReplPanelProvider = class {
     const historyEl = document.getElementById('history');
     const contextEl = document.getElementById('context');
     const varsEl = document.getElementById('vars');
+    const pinsEl = document.getElementById('pins');
     const commandHistory = [];
     let historyIndex = -1;
 
@@ -1049,26 +1593,59 @@ var ReplPanelProvider = class {
       if (data.type === 'state') {
         contextEl.textContent = data.summary;
         varsEl.textContent = data.variables.length ? 'Available: ' + data.variables.join(', ') : '';
+        renderPins(data.pins);
         renderHistory(data.history);
       }
     });
 
-    function renderHistory(results) {
-      historyEl.innerHTML = '';
-      for (const result of results) {
-        appendResult(result);
+    function renderPins(pins) {
+      pinsEl.innerHTML = '';
+      if (!pins.length) {
+        pinsEl.innerHTML = '<div class="pin">(waiting for pinned paths)</div>';
+        return;
+      }
+
+      for (const pin of pins) {
+        const div = document.createElement('div');
+        div.className = 'pin';
+        div.innerHTML =
+          '<div class="pin-head">' +
+            '<div class="pin-path">' + escapeHtml(pin.path) + '</div>' +
+            '<button type="button" data-remove-pin="' + escapeHtml(pin.id) + '">remove</button>' +
+          '</div>' +
+          '<div class="pin-location">' + escapeHtml(pin.file + ':' + (pin.line + 1)) + '</div>' +
+          '<div class="pin-history">' +
+            (pin.history.length
+              ? pin.history.map((entry) =>
+                  '<div class="pin-item ' + (entry.changed ? 'changed' : '') + '">' +
+                    '<span>' + escapeHtml(entry.time) + '</span>' +
+                    '<span>' + escapeHtml(entry.value) + '</span>' +
+                    '<span>' + (entry.changed ? 'changed' : '') + '</span>' +
+                  '</div>'
+                ).join('')
+              : '<div>(waiting for updates...)</div>') +
+          '</div>';
+        pinsEl.appendChild(div);
+      }
+
+      for (const button of pinsEl.querySelectorAll('[data-remove-pin]')) {
+        button.addEventListener('click', () => {
+          vscode.postMessage({ type: 'removePin', id: button.dataset.removePin });
+        });
       }
     }
 
-    function appendResult(result) {
-      const div = document.createElement('div');
-      div.className = 'entry';
-      div.innerHTML = '<div class="prompt">&gt; ' + escapeHtml(result.input) + '</div>' +
-        (result.error
-          ? '<div class="error">\u2717 ' + escapeHtml(result.error) + '</div>'
-          : '<div class="result">\u2190 ' + escapeHtml(result.output) + '</div>');
-      historyEl.appendChild(div);
-      historyEl.scrollTop = historyEl.scrollHeight;
+    function renderHistory(results) {
+      historyEl.innerHTML = '';
+      for (const result of results) {
+        const div = document.createElement('div');
+        div.className = 'entry';
+        div.innerHTML = '<div class="prompt">&gt; ' + escapeHtml(result.input) + '</div>' +
+          (result.error
+            ? '<div class="error">\u2717 ' + escapeHtml(result.error) + '</div>'
+            : '<div class="result">\u2190 ' + escapeHtml(result.output) + '</div>');
+        historyEl.appendChild(div);
+      }
     }
 
     function escapeHtml(value) {
@@ -1270,12 +1847,30 @@ function matchNetworkToLocation(output, locations) {
   });
   return ranked[0]?.location ?? null;
 }
+function summarizeEntryPatterns(entries) {
+  if (entries.length < 10) {
+    return void 0;
+  }
+  const values = entries.map((entry) => entry.parsedValue).filter((value) => value !== void 0);
+  if (values.length < 10) {
+    return void 0;
+  }
+  const patterns = classifyEntries(values);
+  if (patterns.size <= 1) {
+    return void 0;
+  }
+  return summarizePatterns(patterns);
+}
 
 // src/extension.ts
 var GhostLogController = class {
   constructor(context) {
     this.context = context;
     this.enabled = this.getConfig("enabled", true);
+    const workspaceRoot = this.getWorkspaceRoot();
+    if (workspaceRoot) {
+      this.lensStore.load(workspaceRoot);
+    }
     this.decorationTypes = {
       log: vscode4.window.createTextEditorDecorationType(getDecorationOptions("log")),
       info: vscode4.window.createTextEditorDecorationType(getDecorationOptions("info")),
@@ -1286,7 +1881,13 @@ var GhostLogController = class {
     this.logViewer = new LogViewerProvider(context, {
       clearAll: () => this.clearAll(),
       exportAll: () => this.exportAll(),
-      openEntry: (entryId) => this.openEntry(entryId)
+      openEntry: (entryId) => this.openEntry(entryId),
+      pinPath: (file, line, pinPath) => this.pinPath(file, line, pinPath),
+      removePin: (id) => this.removePin(id),
+      focusLine: (file, line) => this.focusLineInViewer(file, line)
+    });
+    this.replPanel = new ReplPanelProvider({
+      removePin: (id) => this.removePin(id)
     });
   }
   decorationTypes;
@@ -1296,9 +1897,11 @@ var GhostLogController = class {
   terminalBuffers = /* @__PURE__ */ new Map();
   entryOrder = [];
   diffManager = new LogDiffManager();
+  lensStore = new LensStore();
+  pinStore = new PinStore();
   logViewer;
   logpointManager;
-  replPanel = new ReplPanelProvider();
+  replPanel;
   ghostlogBreakpoints = [];
   currentDiff;
   mcpServer;
@@ -1319,11 +1922,16 @@ var GhostLogController = class {
         toggle: () => this.toggle(),
         clearFile: () => this.clearFile(vscode4.window.activeTextEditor?.document.uri.fsPath),
         addLogpoint: () => this.addLogpointHere(),
+        addLens: () => this.addLensHere(),
+        editLens: () => this.editLensHere(),
+        removeLens: () => this.removeLensHere(),
+        pinPath: () => this.pinPathHere(),
         snapshotLogs: () => this.snapshotLogs(),
         diffLogs: () => this.diffLogs(),
         startMcp: () => this.startMcp(),
         stopMcp: () => this.stopMcp(),
-        focusLogViewer: () => vscode4.commands.executeCommand("ghostlog.logViewer.focus")
+        focusLogViewer: () => vscode4.commands.executeCommand("ghostlog.logViewer.focus"),
+        focusLineInViewer: (file, line) => this.focusLineInViewer(file, line)
       })
     );
     disposables.push(
@@ -1391,15 +1999,18 @@ var GhostLogController = class {
   getConfig(key, fallback) {
     return vscode4.workspace.getConfiguration("ghostlog").get(key, fallback);
   }
+  getWorkspaceRoot() {
+    return vscode4.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  }
   isSupportedDocument(document) {
     return ["javascript", "javascriptreact", "typescript", "typescriptreact"].includes(document.languageId);
   }
   resolveLogpointStoragePath() {
     const workspace3 = vscode4.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (workspace3) {
-      return import_node_path2.default.join(workspace3, ".ghostlog", "logpoints.json");
+      return import_node_path3.default.join(workspace3, ".ghostlog", "logpoints.json");
     }
-    return import_node_path2.default.join(this.context.globalStorageUri.fsPath, "logpoints.json");
+    return import_node_path3.default.join(this.context.globalStorageUri.fsPath, "logpoints.json");
   }
   indexDocument(document) {
     if (!this.isSupportedDocument(document)) {
@@ -1577,11 +2188,12 @@ var GhostLogController = class {
     };
   }
   addEntry(filePath, line, entry) {
+    const nextEntry = this.annotateEntry(filePath, line, entry);
     const byLine = this.entriesByFile.get(filePath) ?? /* @__PURE__ */ new Map();
     const entries = byLine.get(line) ?? [];
-    byLine.set(line, [...entries, entry]);
+    byLine.set(line, [...entries, nextEntry]);
     this.entriesByFile.set(filePath, byLine);
-    this.entryOrder.push(entry);
+    this.entryOrder.push(nextEntry);
     this.currentDiff = void 0;
     this.refreshViewer();
     this.syncReplContext();
@@ -1589,15 +2201,15 @@ var GhostLogController = class {
   }
   syncReplContext() {
     const recentEntries = this.entryOrder.filter((entry) => entry.kind !== "network" && entry.kind !== "timing").slice(-25).reverse();
-    const values = [];
+    const values = /* @__PURE__ */ new Map();
     for (const [index, entry] of recentEntries.entries()) {
-      const rawValue = entry.values.length <= 1 ? entry.values[0] ?? entry.raw : `[${entry.values.join(", ")}]`;
-      values.push({ key: this.toReplKey(entry, index), raw: rawValue });
+      values.set(this.toReplKey(entry, index), entry.parsedValue ?? entry.raw);
     }
-    this.replPanel.updateCapturedValues(values);
+    this.replPanel.updateValues(values);
+    this.replPanel.updatePins(this.pinStore.list());
   }
   toReplKey(entry, index) {
-    const fileName = entry.file ? import_node_path2.default.basename(entry.file).replace(/[^A-Za-z0-9_$]/g, "_") : "unknown";
+    const fileName = entry.file ? import_node_path3.default.basename(entry.file).replace(/[^A-Za-z0-9_$]/g, "_") : "unknown";
     const line = typeof entry.line === "number" ? entry.line + 1 : index;
     return `$${fileName}_${line}`;
   }
@@ -1631,12 +2243,19 @@ var GhostLogController = class {
           if (levelForLine !== level) {
             continue;
           }
+          const command = this.buildLineViewerCommand(editor.document.uri.fsPath, lineNumber);
+          const hover = new vscode4.MarkdownString(`[Open in Log Viewer](${command})`);
+          hover.isTrusted = true;
           decorations.push({
             range: new vscode4.Range(line.range.end, line.range.end),
+            hoverMessage: hover,
             renderOptions: {
               after: {
                 contentText: buildDecorationText(
-                  entries.slice(-this.getConfig("maxLoopValues", 5)).map((entry) => this.truncateEntry(entry))
+                  entries.slice(-this.getConfig("maxLoopValues", 5)).map((entry) => this.truncateEntry(entry)),
+                  {
+                    patternSummary: summarizeEntryPatterns(entries)
+                  }
                 )
               }
             }
@@ -1671,6 +2290,84 @@ var GhostLogController = class {
     this.logpointManager.add(editor.document.uri.fsPath, editor.selection.active.line, expression);
     this.syncLogpointsToBreakpoints();
     vscode4.window.showInformationMessage("GhostLog logpoint added.");
+  }
+  async addLensHere() {
+    const editor = vscode4.window.activeTextEditor;
+    if (!editor) {
+      return;
+    }
+    const line = editor.selection.active.line;
+    const existing = this.lensStore.getForLine(editor.document.uri.fsPath, line);
+    const expression = await vscode4.window.showInputBox({
+      prompt: "Lens expression for this line",
+      placeHolder: ".users.length or x => x.name",
+      value: existing?.expression ?? ""
+    });
+    if (!expression) {
+      return;
+    }
+    if (existing) {
+      this.lensStore.update(existing.id, expression, existing.label);
+    } else {
+      this.lensStore.add(editor.document.uri.fsPath, line, expression);
+    }
+    this.saveLenses();
+    this.rebuildLineEntries(editor.document.uri.fsPath, line);
+    this.renderEditorForFile(editor.document.uri.fsPath);
+    this.refreshViewer();
+  }
+  async editLensHere() {
+    const editor = vscode4.window.activeTextEditor;
+    if (!editor) {
+      return;
+    }
+    const lens = this.lensStore.getForLine(editor.document.uri.fsPath, editor.selection.active.line);
+    if (!lens) {
+      vscode4.window.showWarningMessage("GhostLog has no lens on this line.");
+      return;
+    }
+    const expression = await vscode4.window.showInputBox({
+      prompt: "Edit lens expression",
+      value: lens.expression
+    });
+    if (!expression) {
+      return;
+    }
+    this.lensStore.update(lens.id, expression, lens.label);
+    this.saveLenses();
+    this.rebuildLineEntries(editor.document.uri.fsPath, editor.selection.active.line);
+    this.renderEditorForFile(editor.document.uri.fsPath);
+    this.refreshViewer();
+  }
+  removeLensHere() {
+    const editor = vscode4.window.activeTextEditor;
+    if (!editor) {
+      return;
+    }
+    const lens = this.lensStore.getForLine(editor.document.uri.fsPath, editor.selection.active.line);
+    if (!lens) {
+      vscode4.window.showWarningMessage("GhostLog has no lens on this line.");
+      return;
+    }
+    this.lensStore.remove(lens.id);
+    this.saveLenses();
+    this.rebuildLineEntries(editor.document.uri.fsPath, editor.selection.active.line);
+    this.renderEditorForFile(editor.document.uri.fsPath);
+    this.refreshViewer();
+  }
+  async pinPathHere() {
+    const editor = vscode4.window.activeTextEditor;
+    if (!editor) {
+      return;
+    }
+    const pinPath = await vscode4.window.showInputBox({
+      prompt: "Path to subscribe for this log line",
+      placeHolder: "response.users[0].status"
+    });
+    if (!pinPath) {
+      return;
+    }
+    this.pinPath(editor.document.uri.fsPath, editor.selection.active.line, pinPath);
   }
   syncLogpointsToBreakpoints() {
     if (this.ghostlogBreakpoints.length > 0) {
@@ -1721,7 +2418,94 @@ var GhostLogController = class {
     });
   }
   refreshViewer() {
-    this.logViewer.update(this.entryOrder, this.currentDiff);
+    this.logViewer.update(this.entryOrder, this.currentDiff, this.pinStore.list());
+    this.replPanel.updatePins(this.pinStore.list());
+  }
+  annotateEntry(filePath, line, entry, trackPins = true) {
+    const parsedValue = this.deriveParsedValue(entry);
+    const nextEntry = { ...entry, parsedValue };
+    if (parsedValue !== void 0) {
+      nextEntry.patternSignature = detectPattern(parsedValue);
+      if (trackPins) {
+        this.pinStore.onNewValue(filePath, line, parsedValue);
+      }
+    }
+    const lens = this.lensStore.getForLine(filePath, line);
+    if (lens?.enabled && parsedValue !== void 0) {
+      const applied = applyLens(parsedValue, lens.expression);
+      nextEntry.lens = {
+        expression: lens.expression,
+        label: lens.label,
+        result: applied.result,
+        error: applied.error
+      };
+    }
+    return nextEntry;
+  }
+  deriveParsedValue(entry) {
+    if (entry.kind === "network") {
+      return entry.network;
+    }
+    if (entry.kind === "timing") {
+      return entry.timing;
+    }
+    if (entry.values.length === 1) {
+      return reviveCapturedValue(entry.values[0] ?? entry.raw);
+    }
+    if (entry.values.length > 1) {
+      return entry.values.map((value) => reviveCapturedValue(value));
+    }
+    return entry.raw ? reviveCapturedValue(entry.raw) : void 0;
+  }
+  rebuildLineEntries(filePath, line) {
+    const byLine = this.entriesByFile.get(filePath);
+    const entries = byLine?.get(line);
+    if (!entries?.length) {
+      return;
+    }
+    const rebuilt = entries.map((entry) => this.annotateEntry(filePath, line, entry, false));
+    byLine.set(line, [...rebuilt]);
+    for (let index = 0; index < this.entryOrder.length; index += 1) {
+      const entry = this.entryOrder[index];
+      if (entry.file === filePath && entry.line === line) {
+        const next = rebuilt.shift();
+        if (next) {
+          this.entryOrder[index] = next;
+        }
+      }
+    }
+  }
+  buildLineViewerCommand(file, line) {
+    return `command:ghostlog.focusLineInViewer?${encodeURIComponent(JSON.stringify([file, line]))}`;
+  }
+  focusLineInViewer(file, line) {
+    this.logViewer.setFocusedLine(file, line);
+    return vscode4.commands.executeCommand("ghostlog.logViewer.focus");
+  }
+  pinPath(file, line, pinPath) {
+    const existing = this.pinStore.getForLine(file, line).find((pin) => pin.path === pinPath);
+    if (!existing) {
+      this.pinStore.add(file, line, pinPath);
+    }
+    for (const entry of this.getEntriesForLine(file, line)) {
+      if (entry.parsedValue !== void 0) {
+        this.pinStore.onNewValue(file, line, entry.parsedValue);
+      }
+    }
+    this.refreshViewer();
+    this.syncReplContext();
+  }
+  removePin(id) {
+    this.pinStore.remove(id);
+    this.refreshViewer();
+    this.syncReplContext();
+  }
+  saveLenses() {
+    const workspaceRoot = this.getWorkspaceRoot();
+    if (!workspaceRoot) {
+      return;
+    }
+    this.lensStore.save(workspaceRoot);
   }
   async injectDebugRuntime(session) {
     try {

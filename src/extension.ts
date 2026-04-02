@@ -1,5 +1,7 @@
 import path from 'node:path'
 import * as vscode from 'vscode'
+import { detectPattern } from './classifier.js'
+import { applyLens, LensStore } from './lens.js'
 import { registerCommands } from './commands.js'
 import { buildDecorationText, getDecorationOptions } from './decorator.js'
 import { LogDiffManager, type LogDiff } from './diff.js'
@@ -8,6 +10,7 @@ import { generateInjectionScript } from './injector.js'
 import { LogViewerProvider } from './log-viewer.js'
 import { LogpointManager, type Logpoint } from './logpoint.js'
 import { startMcpServer, type McpServerHandle } from './mcp-server.js'
+import { PinStore } from './pin.js'
 import { ReplPanelProvider } from './repl-panel.js'
 import {
   formatNetworkEntry,
@@ -17,11 +20,13 @@ import {
   type StructuredPayload
 } from './parser.js'
 import { classifyDuration } from './perf.js'
+import { reviveCapturedValue } from './repl.js'
 import {
   findLogLocations,
   findNetworkLocations,
   matchNetworkToLocation,
   matchOutputToLocation,
+  summarizeEntryPatterns,
   type LogLocation
 } from './tracker.js'
 import type { LogEntry, LogLevel } from './types.js'
@@ -36,9 +41,11 @@ class GhostLogController {
   private readonly terminalBuffers = new Map<string, string>()
   private readonly entryOrder: LogEntry[] = []
   private readonly diffManager = new LogDiffManager()
+  private readonly lensStore = new LensStore()
+  private readonly pinStore = new PinStore()
   private readonly logViewer: LogViewerProvider
   private readonly logpointManager: LogpointManager
-  private readonly replPanel = new ReplPanelProvider()
+  private readonly replPanel: ReplPanelProvider
   private ghostlogBreakpoints: vscode.SourceBreakpoint[] = []
   private currentDiff?: LogDiff
   private mcpServer?: McpServerHandle
@@ -46,6 +53,10 @@ class GhostLogController {
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.enabled = this.getConfig<boolean>('enabled', true)
+    const workspaceRoot = this.getWorkspaceRoot()
+    if (workspaceRoot) {
+      this.lensStore.load(workspaceRoot)
+    }
     this.decorationTypes = {
       log: vscode.window.createTextEditorDecorationType(getDecorationOptions('log')),
       info: vscode.window.createTextEditorDecorationType(getDecorationOptions('info')),
@@ -56,7 +67,13 @@ class GhostLogController {
     this.logViewer = new LogViewerProvider(context, {
       clearAll: () => this.clearAll(),
       exportAll: () => this.exportAll(),
-      openEntry: (entryId) => this.openEntry(entryId)
+      openEntry: (entryId) => this.openEntry(entryId),
+      pinPath: (file, line, pinPath) => this.pinPath(file, line, pinPath),
+      removePin: (id) => this.removePin(id),
+      focusLine: (file, line) => this.focusLineInViewer(file, line)
+    })
+    this.replPanel = new ReplPanelProvider({
+      removePin: (id) => this.removePin(id)
     })
   }
 
@@ -78,11 +95,16 @@ class GhostLogController {
         toggle: () => this.toggle(),
         clearFile: () => this.clearFile(vscode.window.activeTextEditor?.document.uri.fsPath),
         addLogpoint: () => this.addLogpointHere(),
+        addLens: () => this.addLensHere(),
+        editLens: () => this.editLensHere(),
+        removeLens: () => this.removeLensHere(),
+        pinPath: () => this.pinPathHere(),
         snapshotLogs: () => this.snapshotLogs(),
         diffLogs: () => this.diffLogs(),
         startMcp: () => this.startMcp(),
         stopMcp: () => this.stopMcp(),
-        focusLogViewer: () => vscode.commands.executeCommand('ghostlog.logViewer.focus')
+        focusLogViewer: () => vscode.commands.executeCommand('ghostlog.logViewer.focus'),
+        focusLineInViewer: (file, line) => this.focusLineInViewer(file, line)
       })
     )
 
@@ -160,6 +182,10 @@ class GhostLogController {
 
   private getConfig<T>(key: string, fallback: T): T {
     return vscode.workspace.getConfiguration('ghostlog').get<T>(key, fallback)
+  }
+
+  private getWorkspaceRoot(): string | undefined {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
   }
 
   private isSupportedDocument(document: vscode.TextDocument): boolean {
@@ -398,11 +424,12 @@ class GhostLogController {
   }
 
   private addEntry(filePath: string, line: number, entry: LogEntry): void {
+    const nextEntry = this.annotateEntry(filePath, line, entry)
     const byLine = this.entriesByFile.get(filePath) ?? new Map<number, LogEntry[]>()
     const entries = byLine.get(line) ?? []
-    byLine.set(line, [...entries, entry])
+    byLine.set(line, [...entries, nextEntry])
     this.entriesByFile.set(filePath, byLine)
-    this.entryOrder.push(entry)
+    this.entryOrder.push(nextEntry)
     this.currentDiff = undefined
     this.refreshViewer()
     this.syncReplContext()
@@ -414,15 +441,14 @@ class GhostLogController {
       .filter((entry) => entry.kind !== 'network' && entry.kind !== 'timing')
       .slice(-25)
       .reverse()
-    const values: Array<{ key: string; raw: string }> = []
+    const values = new Map<string, unknown>()
 
     for (const [index, entry] of recentEntries.entries()) {
-      const rawValue =
-        entry.values.length <= 1 ? (entry.values[0] ?? entry.raw) : `[${entry.values.join(', ')}]`
-      values.push({ key: this.toReplKey(entry, index), raw: rawValue })
+      values.set(this.toReplKey(entry, index), entry.parsedValue ?? entry.raw)
     }
 
-    this.replPanel.updateCapturedValues(values)
+    this.replPanel.updateValues(values)
+    this.replPanel.updatePins(this.pinStore.list())
   }
 
   private toReplKey(entry: LogEntry, index: number): string {
@@ -468,14 +494,21 @@ class GhostLogController {
           if (levelForLine !== level) {
             continue
           }
+          const command = this.buildLineViewerCommand(editor.document.uri.fsPath, lineNumber)
+          const hover = new vscode.MarkdownString(`[Open in Log Viewer](${command})`)
+          hover.isTrusted = true
           decorations.push({
             range: new vscode.Range(line.range.end, line.range.end),
+            hoverMessage: hover,
             renderOptions: {
               after: {
                 contentText: buildDecorationText(
                   entries
                     .slice(-this.getConfig<number>('maxLoopValues', 5))
-                    .map((entry) => this.truncateEntry(entry))
+                    .map((entry) => this.truncateEntry(entry)),
+                  {
+                    patternSummary: summarizeEntryPatterns(entries)
+                  }
                 )
               }
             }
@@ -514,6 +547,88 @@ class GhostLogController {
     this.logpointManager.add(editor.document.uri.fsPath, editor.selection.active.line, expression)
     this.syncLogpointsToBreakpoints()
     vscode.window.showInformationMessage('GhostLog logpoint added.')
+  }
+
+  private async addLensHere(): Promise<void> {
+    const editor = vscode.window.activeTextEditor
+    if (!editor) {
+      return
+    }
+    const line = editor.selection.active.line
+    const existing = this.lensStore.getForLine(editor.document.uri.fsPath, line)
+    const expression = await vscode.window.showInputBox({
+      prompt: 'Lens expression for this line',
+      placeHolder: '.users.length or x => x.name',
+      value: existing?.expression ?? ''
+    })
+    if (!expression) {
+      return
+    }
+    if (existing) {
+      this.lensStore.update(existing.id, expression, existing.label)
+    } else {
+      this.lensStore.add(editor.document.uri.fsPath, line, expression)
+    }
+    this.saveLenses()
+    this.rebuildLineEntries(editor.document.uri.fsPath, line)
+    this.renderEditorForFile(editor.document.uri.fsPath)
+    this.refreshViewer()
+  }
+
+  private async editLensHere(): Promise<void> {
+    const editor = vscode.window.activeTextEditor
+    if (!editor) {
+      return
+    }
+    const lens = this.lensStore.getForLine(editor.document.uri.fsPath, editor.selection.active.line)
+    if (!lens) {
+      vscode.window.showWarningMessage('GhostLog has no lens on this line.')
+      return
+    }
+    const expression = await vscode.window.showInputBox({
+      prompt: 'Edit lens expression',
+      value: lens.expression
+    })
+    if (!expression) {
+      return
+    }
+    this.lensStore.update(lens.id, expression, lens.label)
+    this.saveLenses()
+    this.rebuildLineEntries(editor.document.uri.fsPath, editor.selection.active.line)
+    this.renderEditorForFile(editor.document.uri.fsPath)
+    this.refreshViewer()
+  }
+
+  private removeLensHere(): void {
+    const editor = vscode.window.activeTextEditor
+    if (!editor) {
+      return
+    }
+    const lens = this.lensStore.getForLine(editor.document.uri.fsPath, editor.selection.active.line)
+    if (!lens) {
+      vscode.window.showWarningMessage('GhostLog has no lens on this line.')
+      return
+    }
+    this.lensStore.remove(lens.id)
+    this.saveLenses()
+    this.rebuildLineEntries(editor.document.uri.fsPath, editor.selection.active.line)
+    this.renderEditorForFile(editor.document.uri.fsPath)
+    this.refreshViewer()
+  }
+
+  private async pinPathHere(): Promise<void> {
+    const editor = vscode.window.activeTextEditor
+    if (!editor) {
+      return
+    }
+    const pinPath = await vscode.window.showInputBox({
+      prompt: 'Path to subscribe for this log line',
+      placeHolder: 'response.users[0].status'
+    })
+    if (!pinPath) {
+      return
+    }
+    this.pinPath(editor.document.uri.fsPath, editor.selection.active.line, pinPath)
   }
 
   private syncLogpointsToBreakpoints(): void {
@@ -571,7 +686,106 @@ class GhostLogController {
   }
 
   private refreshViewer(): void {
-    this.logViewer.update(this.entryOrder, this.currentDiff)
+    this.logViewer.update(this.entryOrder, this.currentDiff, this.pinStore.list())
+    this.replPanel.updatePins(this.pinStore.list())
+  }
+
+  private annotateEntry(filePath: string, line: number, entry: LogEntry, trackPins = true): LogEntry {
+    const parsedValue = this.deriveParsedValue(entry)
+    const nextEntry: LogEntry = { ...entry, parsedValue }
+
+    if (parsedValue !== undefined) {
+      nextEntry.patternSignature = detectPattern(parsedValue)
+      if (trackPins) {
+        this.pinStore.onNewValue(filePath, line, parsedValue)
+      }
+    }
+
+    const lens = this.lensStore.getForLine(filePath, line)
+    if (lens?.enabled && parsedValue !== undefined) {
+      const applied = applyLens(parsedValue, lens.expression)
+      nextEntry.lens = {
+        expression: lens.expression,
+        label: lens.label,
+        result: applied.result,
+        error: applied.error
+      }
+    }
+
+    return nextEntry
+  }
+
+  private deriveParsedValue(entry: LogEntry): unknown {
+    if (entry.kind === 'network') {
+      return entry.network
+    }
+    if (entry.kind === 'timing') {
+      return entry.timing
+    }
+    if (entry.values.length === 1) {
+      return reviveCapturedValue(entry.values[0] ?? entry.raw)
+    }
+    if (entry.values.length > 1) {
+      return entry.values.map((value) => reviveCapturedValue(value))
+    }
+    return entry.raw ? reviveCapturedValue(entry.raw) : undefined
+  }
+
+  private rebuildLineEntries(filePath: string, line: number): void {
+    const byLine = this.entriesByFile.get(filePath)
+    const entries = byLine?.get(line)
+    if (!entries?.length) {
+      return
+    }
+
+    const rebuilt = entries.map((entry) => this.annotateEntry(filePath, line, entry, false))
+    byLine!.set(line, [...rebuilt])
+    for (let index = 0; index < this.entryOrder.length; index += 1) {
+      const entry = this.entryOrder[index]
+      if (entry.file === filePath && entry.line === line) {
+        const next = rebuilt.shift()
+        if (next) {
+          this.entryOrder[index] = next
+        }
+      }
+    }
+  }
+
+  private buildLineViewerCommand(file: string, line: number): string {
+    return `command:ghostlog.focusLineInViewer?${encodeURIComponent(JSON.stringify([file, line]))}`
+  }
+
+  private focusLineInViewer(file: string, line: number): Thenable<void> {
+    this.logViewer.setFocusedLine(file, line)
+    return vscode.commands.executeCommand('ghostlog.logViewer.focus')
+  }
+
+  private pinPath(file: string, line: number, pinPath: string): void {
+    const existing = this.pinStore.getForLine(file, line).find((pin) => pin.path === pinPath)
+    if (!existing) {
+      this.pinStore.add(file, line, pinPath)
+    }
+    for (const entry of this.getEntriesForLine(file, line)) {
+      if (entry.parsedValue !== undefined) {
+        this.pinStore.onNewValue(file, line, entry.parsedValue)
+      }
+    }
+    this.refreshViewer()
+    this.syncReplContext()
+  }
+
+  private removePin(id: string): void {
+    this.pinStore.remove(id)
+    this.refreshViewer()
+    this.syncReplContext()
+  }
+
+  private saveLenses(): void {
+    const workspaceRoot = this.getWorkspaceRoot()
+    if (!workspaceRoot) {
+      return
+    }
+    this.lensStore.save(workspaceRoot)
   }
 
   private async injectDebugRuntime(session: vscode.DebugSession): Promise<void> {

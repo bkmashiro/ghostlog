@@ -19,6 +19,10 @@
     "onView:ghostlog.logViewer",
     "onView:ghostlog.repl",
     "onCommand:ghostlog.addLogpoint",
+    "onCommand:ghostlog.addLens",
+    "onCommand:ghostlog.editLens",
+    "onCommand:ghostlog.removeLens",
+    "onCommand:ghostlog.pinPath",
     "onCommand:ghostlog.snapshotLogs",
     "onCommand:ghostlog.diffLogs",
     "onCommand:ghostlog.startMcp",
@@ -42,6 +46,22 @@
       {
         "command": "ghostlog.addLogpoint",
         "title": "GhostLog: Add Logpoint Here"
+      },
+      {
+        "command": "ghostlog.addLens",
+        "title": "GhostLog: Add Lens to This Line"
+      },
+      {
+        "command": "ghostlog.editLens",
+        "title": "GhostLog: Edit Lens Expression"
+      },
+      {
+        "command": "ghostlog.removeLens",
+        "title": "GhostLog: Remove Lens from This Line"
+      },
+      {
+        "command": "ghostlog.pinPath",
+        "title": "GhostLog: Pin Path"
       },
       {
         "command": "ghostlog.snapshotLogs",

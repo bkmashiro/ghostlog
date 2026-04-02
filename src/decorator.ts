@@ -1,5 +1,6 @@
 import { formatNetworkEntry, groupEntries } from './parser.js'
 import { classifyDuration } from './perf.js'
+import { formatValue } from './repl.js'
 import type { LogEntry } from './types.js'
 
 export interface InlineDecoration {
@@ -8,7 +9,10 @@ export interface InlineDecoration {
   level: LogEntry['level']
 }
 
-export function buildDecorationText(entries: LogEntry[]): string {
+export function buildDecorationText(
+  entries: LogEntry[],
+  options?: { patternSummary?: string }
+): string {
   if (entries.length === 0) {
     return ''
   }
@@ -41,6 +45,14 @@ export function buildDecorationText(entries: LogEntry[]): string {
     entries.find((entry) => entry.level === 'warn')?.level ??
     entries[0].level
   const prefix = highestLevel === 'error' ? '⚠' : highestLevel === 'warn' ? '👻 !' : '👻'
+  const latestLens = entries.at(-1)?.lens
+  if (latestLens) {
+    const rendered = latestLens.error ? `Error: ${latestLens.error}` : formatValue(latestLens.result, 2)
+    return `${prefix} (lens: ${latestLens.label ?? latestLens.expression}) → ${rendered}`
+  }
+  if (options?.patternSummary) {
+    return `${prefix} ${options.patternSummary}`
+  }
   const text = groupEntries(entries)
   return text ? `${prefix} ${text}` : prefix
 }
