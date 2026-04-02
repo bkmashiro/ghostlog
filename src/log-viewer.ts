@@ -3,6 +3,7 @@ import { classifyEntries } from './classifier.js'
 import type { LogDiff } from './diff.js'
 import type { PinnedPath } from './pin.js'
 import { formatValue } from './repl.js'
+import type { TimelineFrame } from './time-travel.js'
 import type { LogEntry } from './types.js'
 
 export interface LogViewerActions {
@@ -12,6 +13,13 @@ export interface LogViewerActions {
   pinPath: (file: string, line: number, path: string) => void
   removePin: (id: string) => void
   focusLine: (file: string, line: number) => void
+  seekTimeline: (file: string, line: number, seq: number) => void
+  stepTimeline: (file: string, line: number, direction: 'backward' | 'forward') => void
+}
+
+export interface TimeTravelState {
+  frames: TimelineFrame[]
+  currentSeq?: number
 }
 
 export class LogViewerProvider implements vscode.WebviewViewProvider {
@@ -21,6 +29,7 @@ export class LogViewerProvider implements vscode.WebviewViewProvider {
   private diff?: LogDiff
   private pins: PinnedPath[] = []
   private focusedLine?: { file: string; line: number }
+  private timeTravel: TimeTravelState = { frames: [] }
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -52,15 +61,30 @@ export class LogViewerProvider implements vscode.WebviewViewProvider {
         typeof message.line === 'number'
       ) {
         this.actions.focusLine(message.file, message.line)
+      } else if (
+        message.type === 'timelineSeek' &&
+        typeof message.file === 'string' &&
+        typeof message.line === 'number' &&
+        typeof message.seq === 'number'
+      ) {
+        this.actions.seekTimeline(message.file, message.line, message.seq)
+      } else if (
+        message.type === 'timelineStep' &&
+        typeof message.file === 'string' &&
+        typeof message.line === 'number' &&
+        (message.direction === 'backward' || message.direction === 'forward')
+      ) {
+        this.actions.stepTimeline(message.file, message.line, message.direction)
       }
     })
     this.render()
   }
 
-  update(entries: LogEntry[], diff?: LogDiff, pins: PinnedPath[] = []): void {
+  update(entries: LogEntry[], diff?: LogDiff, pins: PinnedPath[] = [], timeTravel: TimeTravelState = { frames: [] }): void {
     this.entries = [...entries]
     this.diff = diff
     this.pins = [...pins]
+    this.timeTravel = timeTravel
     this.render()
   }
 
@@ -167,6 +191,7 @@ export class LogViewerProvider implements vscode.WebviewViewProvider {
       focus && latestFocusedEntry?.parsedValue !== undefined
         ? this.renderPinnedValueTree(latestFocusedEntry.parsedValue, focus.file, focus.line)
         : '<div class="empty">Select a structured value to browse pin paths.</div>'
+    const timelineMarkup = this.renderTimeTravel(focus)
 
     this.view.webview.html = `<!DOCTYPE html>
 <html lang="en">
@@ -212,6 +237,9 @@ export class LogViewerProvider implements vscode.WebviewViewProvider {
     .tree-row { align-items: center; display: grid; gap: 8px; grid-template-columns: 1fr auto auto; margin-left: var(--indent, 0px); }
     .tree-path { font-family: var(--vscode-editor-font-family); word-break: break-word; }
     .tree-value { opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .timeline-controls { align-items: center; display: grid; gap: 8px; grid-template-columns: auto auto 1fr auto; margin-bottom: 8px; }
+    .timeline-meta { display: flex; gap: 10px; font-size: 11px; opacity: 0.8; }
+    .timeline-value { border: 1px solid var(--vscode-panel-border); border-radius: 8px; font-family: var(--vscode-editor-font-family); font-size: 12px; overflow: auto; padding: 8px; white-space: pre-wrap; word-break: break-word; }
     .empty { font-size: 12px; opacity: 0.75; }
   </style>
 </head>
@@ -234,6 +262,10 @@ export class LogViewerProvider implements vscode.WebviewViewProvider {
         </thead>
         <tbody id="rows">${rows}</tbody>
       </table>
+    </div>
+    <div class="panel">
+      <h3>Time Travel</h3>
+      ${timelineMarkup}
     </div>
     <div class="panel">
       <div class="tabs">
@@ -290,6 +322,26 @@ export class LogViewerProvider implements vscode.WebviewViewProvider {
     for (const button of document.querySelectorAll('[data-remove-pin]')) {
       button.addEventListener('click', () => vscode.postMessage({ type: 'removePin', id: button.dataset.removePin }));
     }
+    for (const slider of document.querySelectorAll('[data-timeline-slider]')) {
+      slider.addEventListener('input', () => {
+        vscode.postMessage({
+          type: 'timelineSeek',
+          file: slider.dataset.file,
+          line: Number(slider.dataset.line),
+          seq: Number(slider.value)
+        });
+      });
+    }
+    for (const button of document.querySelectorAll('[data-timeline-step]')) {
+      button.addEventListener('click', () => {
+        vscode.postMessage({
+          type: 'timelineStep',
+          file: button.dataset.file,
+          line: Number(button.dataset.line),
+          direction: button.dataset.timelineStep
+        });
+      });
+    }
     for (const tab of document.querySelectorAll('[data-tab]')) {
       tab.addEventListener('click', () => {
         for (const current of document.querySelectorAll('[data-tab]')) {
@@ -302,6 +354,25 @@ export class LogViewerProvider implements vscode.WebviewViewProvider {
     }
 
     applyFilters();
+
+    document.addEventListener('keydown', (event) => {
+      if (!(event.ctrlKey || event.metaKey)) {
+        return;
+      }
+      const timeline = document.querySelector('[data-timeline-slider]');
+      if (!timeline) {
+        return;
+      }
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        vscode.postMessage({
+          type: 'timelineStep',
+          file: timeline.dataset.file,
+          line: Number(timeline.dataset.line),
+          direction: event.key === 'ArrowLeft' ? 'backward' : 'forward'
+        });
+        event.preventDefault();
+      }
+    });
 
     function applyFilters() {
       const query = filter.value.toLowerCase();
@@ -357,6 +428,30 @@ export class LogViewerProvider implements vscode.WebviewViewProvider {
     }
 
     return rows.join('')
+  }
+
+  private renderTimeTravel(focus?: { file: string; line: number }): string {
+    if (!focus || this.timeTravel.frames.length === 0) {
+      return '<div class="empty">Focus a line with captured values to scrub its history.</div>'
+    }
+    const first = this.timeTravel.frames[0]
+    const last = this.timeTravel.frames.at(-1)!
+    const current =
+      this.timeTravel.frames.find((frame) => frame.seq === this.timeTravel.currentSeq) ??
+      last
+    const deltaLabel = current.deltaKeys.length > 0 ? current.deltaKeys.join(', ') : '(no change)'
+    return `<div class="timeline-controls">
+      <button type="button" data-timeline-step="backward" data-file="${escapeHtml(focus.file)}" data-line="${focus.line}">Prev</button>
+      <button type="button" data-timeline-step="forward" data-file="${escapeHtml(focus.file)}" data-line="${focus.line}">Next</button>
+      <input type="range" min="${first.seq}" max="${last.seq}" value="${current.seq}" data-timeline-slider="true" data-file="${escapeHtml(focus.file)}" data-line="${focus.line}" />
+      <span>#${current.seq}</span>
+    </div>
+    <div class="timeline-meta">
+      <span>${escapeHtml(new Date(current.timestamp).toLocaleTimeString())}</span>
+      <span>Δ ${escapeHtml(deltaLabel)}</span>
+      <span>${escapeHtml(`${this.timeTravel.frames.length} frames`)}</span>
+    </div>
+    <div class="timeline-value">${escapeHtml(formatValue(current.value, 2))}</div>`
   }
 }
 

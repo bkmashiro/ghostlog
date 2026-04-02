@@ -1,14 +1,16 @@
 import path from 'node:path'
 import * as vscode from 'vscode'
+import { formatAnnotation } from './annotation.js'
 import { detectPattern } from './classifier.js'
 import { applyLens, LensStore } from './lens.js'
 import { registerCommands } from './commands.js'
 import { DecorationDebouncer } from './debounce.js'
 import { buildDecorationText, getDecorationOptions } from './decorator.js'
 import { LogDiffManager, type LogDiff } from './diff.js'
+import { exportLogs, saveExport, type ExportFormat } from './export.js'
 import { LogHoverProvider } from './hover.js'
 import { generateInjectionScript } from './injector.js'
-import { LogBufferManager } from './log-buffer.js'
+import { LogBufferManager, type LogLineBuffer } from './log-buffer.js'
 import { LogViewerProvider } from './log-viewer.js'
 import { LogpointManager, type Logpoint } from './logpoint.js'
 import { startMcpServer, type McpServerHandle } from './mcp-server.js'
@@ -23,6 +25,7 @@ import {
 } from './parser.js'
 import { classifyDuration } from './perf.js'
 import { reviveCapturedValue } from './repl.js'
+import { TimeTravel, type TimelineFrame } from './time-travel.js'
 import {
   findLogLocations,
   findNetworkLocations,
@@ -50,14 +53,18 @@ class GhostLogController {
   private readonly logpointManager: LogpointManager
   private readonly replPanel: ReplPanelProvider
   private decorationDebouncer: DecorationDebouncer
+  private timeTravel: TimeTravel
   private ghostlogBreakpoints: vscode.SourceBreakpoint[] = []
   private currentDiff?: LogDiff
   private mcpServer?: McpServerHandle
+  private focusedViewerLine?: { file: string; line: number }
+  private scrubbedFrames = new Map<string, TimelineFrame>()
   private enabled: boolean
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.enabled = this.getConfig<boolean>('enabled', true)
     this.logBuffers = this.createLogBufferManager()
+    this.timeTravel = new TimeTravel(this.logBuffers)
     this.decorationDebouncer = this.createDecorationDebouncer()
     const workspaceRoot = this.getWorkspaceRoot()
     if (workspaceRoot) {
@@ -76,7 +83,9 @@ class GhostLogController {
       openEntry: (entryId) => this.openEntry(entryId),
       pinPath: (file, line, pinPath) => this.pinPath(file, line, pinPath),
       removePin: (id) => this.removePin(id),
-      focusLine: (file, line) => this.focusLineInViewer(file, line)
+      focusLine: (file, line) => this.focusLineInViewer(file, line),
+      seekTimeline: (file, line, seq) => this.seekTimeTravel(file, line, seq),
+      stepTimeline: (file, line, direction) => this.stepTimeTravel(file, line, direction)
     })
     this.replPanel = new ReplPanelProvider({
       removePin: (id) => this.removePin(id)
@@ -101,6 +110,8 @@ class GhostLogController {
         clearAll: () => this.clearAll(),
         toggle: () => this.toggle(),
         clearFile: () => this.clearFile(vscode.window.activeTextEditor?.document.uri.fsPath),
+        exportLogs: () => this.exportAll(),
+        timeTravel: () => this.openTimeTravel(),
         addLogpoint: () => this.addLogpointHere(),
         addLens: () => this.addLensHere(),
         editLens: () => this.editLensHere(),
@@ -231,6 +242,7 @@ class GhostLogController {
     this.entriesByFile.clear()
     this.entryOrder.length = 0
     this.logBuffers.clear()
+    this.scrubbedFrames.clear()
     this.currentDiff = undefined
     this.refreshViewer()
     this.syncReplContext()
@@ -243,6 +255,11 @@ class GhostLogController {
     }
     this.entriesByFile.delete(filePath)
     this.logBuffers.clear(filePath)
+    for (const key of [...this.scrubbedFrames.keys()]) {
+      if (key.startsWith(`${filePath}:`)) {
+        this.scrubbedFrames.delete(key)
+      }
+    }
     for (let index = this.entryOrder.length - 1; index >= 0; index -= 1) {
       if (this.entryOrder[index].file === filePath) {
         this.entryOrder.splice(index, 1)
@@ -450,7 +467,7 @@ class GhostLogController {
     this.entriesByFile.set(filePath, byLine)
     this.entryOrder.push(nextEntry)
     if (nextEntry.parsedValue !== undefined) {
-      this.logBuffers.add(filePath, line, nextEntry.parsedValue, nextEntry.timestamp)
+      this.logBuffers.add(filePath, line, nextEntry.parsedValue, nextEntry.timestamp, nextEntry.level)
     }
     this.currentDiff = undefined
     this.refreshViewer()
@@ -524,13 +541,7 @@ class GhostLogController {
             hoverMessage: hover,
             renderOptions: {
               after: {
-                contentText: buildDecorationText(
-                  entries.map((entry) => this.truncateEntry(entry)),
-                  {
-                    patternSummary: summarizeEntryPatterns(entries),
-                    buffer: this.logBuffers.get(editor.document.uri.fsPath, lineNumber)
-                  }
-                )
+                contentText: this.buildInlineDecoration(editor.document.uri.fsPath, lineNumber, entries)
               }
             }
           })
@@ -538,6 +549,23 @@ class GhostLogController {
       }
       editor.setDecorations(this.decorationTypes[level], decorations)
     }
+  }
+
+  private buildInlineDecoration(filePath: string, lineNumber: number, entries: LogEntry[]): string {
+    const scrubbed = this.scrubbedFrames.get(this.toLineKey(filePath, lineNumber))
+    if (scrubbed) {
+      const highestLevel =
+        entries.find((entry) => entry.level === 'error')?.level ??
+        entries.find((entry) => entry.level === 'warn')?.level ??
+        entries[0]?.level ??
+        'log'
+      const prefix = highestLevel === 'error' ? '⚠' : highestLevel === 'warn' ? '👻 !' : '👻'
+      return `${prefix} ⏪ #${scrubbed.seq} ${formatAnnotation(scrubbed.value)}`
+    }
+    return buildDecorationText(entries.map((entry) => this.truncateEntry(entry)), {
+      patternSummary: summarizeEntryPatterns(entries),
+      buffer: this.logBuffers.get(filePath, lineNumber)
+    })
   }
 
   private truncateEntry(entry: LogEntry): LogEntry {
@@ -689,8 +717,22 @@ class GhostLogController {
   }
 
   private async exportAll(): Promise<void> {
-    await vscode.env.clipboard.writeText(JSON.stringify(this.entryOrder, null, 2))
-    vscode.window.showInformationMessage('GhostLog logs copied as JSON.')
+    const format = await vscode.window.showQuickPick<ExportFormat>(['json', 'csv', 'har', 'markdown'], {
+      placeHolder: 'Choose export format'
+    })
+    if (!format) {
+      return
+    }
+    const content = exportLogs(
+      this.logBuffers.getAll() as LogLineBuffer[],
+      this.entryOrder.flatMap((entry) => (entry.network ? [entry.network] : [])),
+      { format }
+    )
+    if (!content) {
+      vscode.window.showWarningMessage('GhostLog has no logs to export.')
+      return
+    }
+    await saveExport(content, format)
   }
 
   private openEntry(entryId: string): void {
@@ -707,7 +749,14 @@ class GhostLogController {
   }
 
   private refreshViewer(): void {
-    this.logViewer.update(this.entryOrder, this.currentDiff, this.pinStore.list())
+    const focus = this.focusedViewerLine ?? this.getLatestLineWithEntries()
+    const frames = focus ? this.timeTravel.getTimeline(focus.file, focus.line) : []
+    const currentSeq =
+      focus ? (this.timeTravel.currentFrame(focus.file, focus.line) ?? frames.at(-1))?.seq : undefined
+    this.logViewer.update(this.entryOrder, this.currentDiff, this.pinStore.list(), {
+      frames,
+      currentSeq
+    })
     this.replPanel.updatePins(this.pinStore.list())
   }
 
@@ -765,10 +814,11 @@ class GhostLogController {
     for (const [lineNumber, lineEntries] of byLine!.entries()) {
       for (const lineEntry of lineEntries) {
         if (lineEntry.parsedValue !== undefined) {
-          this.logBuffers.add(filePath, lineNumber, lineEntry.parsedValue, lineEntry.timestamp)
+          this.logBuffers.add(filePath, lineNumber, lineEntry.parsedValue, lineEntry.timestamp, lineEntry.level)
         }
       }
     }
+    this.timeTravel = new TimeTravel(this.logBuffers)
     for (let index = 0; index < this.entryOrder.length; index += 1) {
       const entry = this.entryOrder[index]
       if (entry.file === filePath && entry.line === line) {
@@ -785,8 +835,72 @@ class GhostLogController {
     return `command:ghostlog.focusLineInViewer?${encodeURIComponent(JSON.stringify([file, line]))}`
   }
 
-  private focusLineInViewer(file: string, line: number): Thenable<void> {
+  private getLatestLineWithEntries(): { file: string; line: number } | undefined {
+    for (let index = this.entryOrder.length - 1; index >= 0; index -= 1) {
+      const entry = this.entryOrder[index]
+      if (entry.file && typeof entry.line === 'number') {
+        return { file: entry.file, line: entry.line }
+      }
+    }
+    return undefined
+  }
+
+  private toLineKey(file: string, line: number): string {
+    return `${file}:${line}`
+  }
+
+  private async openTimeTravel(): Promise<void> {
+    const editor = vscode.window.activeTextEditor
+    if (!editor) {
+      return
+    }
+    const file = editor.document.uri.fsPath
+    const line = editor.selection.active.line
+    const timeline = this.timeTravel.getTimeline(file, line)
+    if (timeline.length === 0) {
+      vscode.window.showWarningMessage('GhostLog has no captured history for this line.')
+      return
+    }
+    this.focusedViewerLine = { file, line }
+    const frame = this.timeTravel.seekTo(file, line, timeline.at(-1)!.seq)
+    if (frame) {
+      this.scrubbedFrames.set(this.toLineKey(file, line), frame)
+      this.renderEditorForFile(file)
+    }
     this.logViewer.setFocusedLine(file, line)
+    this.refreshViewer()
+    await vscode.commands.executeCommand('ghostlog.logViewer.focus')
+  }
+
+  private seekTimeTravel(file: string, line: number, seq: number): void {
+    this.focusedViewerLine = { file, line }
+    const frame = this.timeTravel.seekTo(file, line, seq)
+    if (!frame) {
+      return
+    }
+    this.scrubbedFrames.set(this.toLineKey(file, line), frame)
+    this.refreshViewer()
+    this.renderEditorForFile(file)
+  }
+
+  private stepTimeTravel(file: string, line: number, direction: 'backward' | 'forward'): void {
+    this.focusedViewerLine = { file, line }
+    const frame =
+      direction === 'forward'
+        ? this.timeTravel.stepForward(file, line)
+        : this.timeTravel.stepBackward(file, line)
+    if (!frame) {
+      return
+    }
+    this.scrubbedFrames.set(this.toLineKey(file, line), frame)
+    this.refreshViewer()
+    this.renderEditorForFile(file)
+  }
+
+  private focusLineInViewer(file: string, line: number): Thenable<void> {
+    this.focusedViewerLine = { file, line }
+    this.logViewer.setFocusedLine(file, line)
+    this.refreshViewer()
     return vscode.commands.executeCommand('ghostlog.logViewer.focus')
   }
 
@@ -839,11 +953,12 @@ class GhostLogController {
       for (const [line, entries] of byLine.entries()) {
         for (const entry of entries) {
           if (entry.parsedValue !== undefined) {
-            this.logBuffers.add(file, line, entry.parsedValue, entry.timestamp)
+            this.logBuffers.add(file, line, entry.parsedValue, entry.timestamp, entry.level)
           }
         }
       }
     }
+    this.timeTravel = new TimeTravel(this.logBuffers)
   }
 
   private async injectDebugRuntime(session: vscode.DebugSession): Promise<void> {

@@ -6,6 +6,8 @@ export interface LogLineBuffer {
   line: number
   base: unknown
   baseSeq: number
+  baseTimestamp: number
+  level: string
   deltas: RingBuffer<Delta>
   totalReceived: number
   totalDropped: number
@@ -46,7 +48,13 @@ export class LogBufferManager {
     this.config = { ...DEFAULT_CONFIG, ...config }
   }
 
-  add(file: string, line: number, value: unknown, timestamp = Date.now()): 'stored' | 'deduplicated' {
+  add(
+    file: string,
+    line: number,
+    value: unknown,
+    timestamp = Date.now(),
+    level = 'log'
+  ): 'stored' | 'deduplicated' {
     const key = toKey(file, line)
     const existing = this.buffers.get(key)
     if (!existing) {
@@ -55,6 +63,8 @@ export class LogBufferManager {
         line,
         base: cloneValue(value),
         baseSeq: 0,
+        baseTimestamp: timestamp,
+        level,
         deltas: new RingBuffer<Delta>(this.config.deltaCapacity),
         totalReceived: 1,
         totalDropped: 0,
@@ -67,6 +77,7 @@ export class LogBufferManager {
     const nextSeq = existing.totalReceived
     const previousValue = this.reconstruct(file, line, existing.totalReceived - 1)
     existing.totalReceived += 1
+    existing.level = level
     existing.latest = serializeValue(value, this.config.maxValueBytes)
 
     const delta = computeDelta(previousValue, value, nextSeq)
@@ -79,6 +90,7 @@ export class LogBufferManager {
     if (evicted) {
       existing.base = applyDelta(existing.base, evicted)
       existing.baseSeq = evicted.seq
+      existing.baseTimestamp = evicted.timestamp
       existing.totalDropped += 1
     }
 
@@ -116,7 +128,7 @@ export class LogBufferManager {
         return []
       }
       const entries: Array<{ seq: number; timestamp: number; value: unknown }> = [
-        { seq: buffer.baseSeq, timestamp: 0, value: cloneValue(buffer.base) }
+        { seq: buffer.baseSeq, timestamp: buffer.baseTimestamp, value: cloneValue(buffer.base) }
       ]
       let current = cloneValue(buffer.base)
       for (const delta of buffer.deltas) {

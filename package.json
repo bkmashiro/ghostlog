@@ -18,6 +18,8 @@
     "onLanguage:typescriptreact",
     "onView:ghostlog.logViewer",
     "onView:ghostlog.repl",
+    "onCommand:ghostlog.exportLogs",
+    "onCommand:ghostlog.timeTravel",
     "onCommand:ghostlog.addLogpoint",
     "onCommand:ghostlog.addLens",
     "onCommand:ghostlog.editLens",
@@ -42,6 +44,14 @@
       {
         "command": "ghostlog.clearFile",
         "title": "GhostLog: Clear This File"
+      },
+      {
+        "command": "ghostlog.exportLogs",
+        "title": "GhostLog: Export Logs"
+      },
+      {
+        "command": "ghostlog.timeTravel",
+        "title": "GhostLog: Time Travel"
       },
       {
         "command": "ghostlog.addLogpoint",

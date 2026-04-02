@@ -1,3 +1,4 @@
+import { formatAnnotation } from './annotation.js'
 import { formatNetworkEntry, groupEntries } from './parser.js'
 import { classifyDuration } from './perf.js'
 import { formatValue } from './repl.js'
@@ -74,22 +75,23 @@ function buildBufferDecorationText(prefix: string, buffer: LogLineBuffer): strin
     .map(([key]) => key)
 
   if (buffer.totalReceived === 1) {
-    return `${prefix} ${latestPreview}`
+    return `${prefix} ${formatAnnotation(buffer.latest.full ?? buffer.base)}`
   }
 
   if (buffer.totalReceived > 1 && buffer.deltas.size === 0) {
-    return `${prefix} ${latestPreview} ×${buffer.totalReceived.toLocaleString()}`
+    return `${prefix} ${formatAnnotation(buffer.latest.full ?? buffer.base)} ×${buffer.totalReceived.toLocaleString()}`
   }
 
   if (buffer.totalReceived <= 3 && buffer.totalDropped === 0) {
     const values = [buffer.base]
       .concat(deltas.map((delta) => replayTo(buffer.base, deltas, delta.seq)))
       .slice(0, buffer.totalReceived)
-      .map((value) => formatValue(value, 1))
+      .map((value) => formatAnnotation(value))
     return `${prefix} ${values.join(' \u2192 ')}`
   }
 
-  const latestLabel = buffer.latest.full !== undefined ? formatValue(buffer.latest.full, 1) : latestPreview
+  const latestLabel =
+    buffer.latest.full !== undefined ? formatAnnotation(buffer.latest.full) : latestPreview
   const hotKeysLabel = hotKeys.length > 0 ? ` [Δ ${hotKeys.join(',')}]` : ''
   const overflowLabel =
     buffer.totalDropped > 0 ? ` [last ${reconstructableEntries.toLocaleString()} entries]` : ''

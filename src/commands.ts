@@ -4,6 +4,8 @@ export interface GhostLogCommandHandlers {
   clearAll: () => void
   toggle: () => void
   clearFile: () => void
+  exportLogs: () => Thenable<void> | void
+  timeTravel: () => Thenable<void> | void
   addLogpoint: () => Thenable<void> | void
   addLens: () => Thenable<void> | void
   editLens: () => Thenable<void> | void
@@ -22,6 +24,8 @@ export function registerCommands(handlers: GhostLogCommandHandlers): vscode.Disp
     vscode.commands.registerCommand('ghostlog.clear', handlers.clearAll),
     vscode.commands.registerCommand('ghostlog.toggle', handlers.toggle),
     vscode.commands.registerCommand('ghostlog.clearFile', handlers.clearFile),
+    vscode.commands.registerCommand('ghostlog.exportLogs', handlers.exportLogs),
+    vscode.commands.registerCommand('ghostlog.timeTravel', handlers.timeTravel),
     vscode.commands.registerCommand('ghostlog.addLogpoint', handlers.addLogpoint),
     vscode.commands.registerCommand('ghostlog.addLens', handlers.addLens),
     vscode.commands.registerCommand('ghostlog.editLens', handlers.editLens),
