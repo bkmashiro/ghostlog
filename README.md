@@ -9,7 +9,7 @@ const user = getUser()
 console.log("user:", user)   // 👻 { id: 1, name: "Alice", email: "alice@co.com" }
 
 for (let i = 0; i < 3; i++) {
-  console.log("i:", i)       // 👻 0  1  2
+  console.log("i:", i)       // 👻 0 → 1 → 2
 }
 
 const err = new Error("oops")
@@ -23,7 +23,7 @@ console.error("error:", err) // ⚠ Error: oops at index.ts:8
 
 ## How It Works
 
-GhostLog listens to debug adapter output events and terminal output, parses emitted console text, matches it back to `console.*` calls in open JavaScript and TypeScript files, then renders the latest values as inline editor decorations.
+GhostLog listens to debug adapter output events and terminal output, parses emitted console text, matches it back to `console.*` calls in open JavaScript and TypeScript files, then renders inline editor decorations backed by delta-compressed per-line history.
 
 Best results come from labeled logs such as `console.log("user:", user)`, because the label makes source matching deterministic.
 
@@ -36,8 +36,9 @@ Best results come from labeled logs such as `console.log("user:", user)`, becaus
 ## Settings
 
 - `ghostlog.enabled`: enable or disable GhostLog.
-- `ghostlog.maxValueLength`: max characters shown per inline value.
-- `ghostlog.maxLoopValues`: max repeated values shown on the same line.
+- `ghostlog.deltaCapacity`: max delta entries to keep per log line.
+- `ghostlog.maxValueKB`: max full-value size kept in memory before GhostLog falls back to preview-only storage.
+- `ghostlog.uiDebounceMs`: debounce window for inline decoration refreshes.
 
 ## Comparison With ConsoleNinja
 

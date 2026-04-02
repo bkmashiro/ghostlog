@@ -1,6 +1,8 @@
 import { formatNetworkEntry, groupEntries } from './parser.js'
 import { classifyDuration } from './perf.js'
 import { formatValue } from './repl.js'
+import { replayTo } from './delta.js'
+import type { LogLineBuffer } from './log-buffer.js'
 import type { LogEntry } from './types.js'
 
 export interface InlineDecoration {
@@ -11,7 +13,7 @@ export interface InlineDecoration {
 
 export function buildDecorationText(
   entries: LogEntry[],
-  options?: { patternSummary?: string }
+  options?: { patternSummary?: string; buffer?: LogLineBuffer }
 ): string {
   if (entries.length === 0) {
     return ''
@@ -50,11 +52,48 @@ export function buildDecorationText(
     const rendered = latestLens.error ? `Error: ${latestLens.error}` : formatValue(latestLens.result, 2)
     return `${prefix} (lens: ${latestLens.label ?? latestLens.expression}) → ${rendered}`
   }
+  const bufferText = options?.buffer ? buildBufferDecorationText(prefix, options.buffer) : ''
+  if (bufferText) {
+    return bufferText
+  }
   if (options?.patternSummary) {
     return `${prefix} ${options.patternSummary}`
   }
   const text = groupEntries(entries)
   return text ? `${prefix} ${text}` : prefix
+}
+
+function buildBufferDecorationText(prefix: string, buffer: LogLineBuffer): string {
+  const deltas = buffer.deltas.toArray()
+  const reconstructableEntries = buffer.deltas.size + 1
+  const latestPreview = buffer.latest.raw
+  const hotKeys = Object.entries(buffer.changeFrequency)
+    .filter(([key]) => key !== '$')
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 3)
+    .map(([key]) => key)
+
+  if (buffer.totalReceived === 1) {
+    return `${prefix} ${latestPreview}`
+  }
+
+  if (buffer.totalReceived > 1 && buffer.deltas.size === 0) {
+    return `${prefix} ${latestPreview} ×${buffer.totalReceived.toLocaleString()}`
+  }
+
+  if (buffer.totalReceived <= 3 && buffer.totalDropped === 0) {
+    const values = [buffer.base]
+      .concat(deltas.map((delta) => replayTo(buffer.base, deltas, delta.seq)))
+      .slice(0, buffer.totalReceived)
+      .map((value) => formatValue(value, 1))
+    return `${prefix} ${values.join(' \u2192 ')}`
+  }
+
+  const latestLabel = buffer.latest.full !== undefined ? formatValue(buffer.latest.full, 1) : latestPreview
+  const hotKeysLabel = hotKeys.length > 0 ? ` [Δ ${hotKeys.join(',')}]` : ''
+  const overflowLabel =
+    buffer.totalDropped > 0 ? ` [last ${reconstructableEntries.toLocaleString()} entries]` : ''
+  return `${prefix} ×${buffer.totalReceived.toLocaleString()}${overflowLabel} [${latestLabel}]${hotKeysLabel}`
 }
 
 export function getDecorationOptions(level: LogEntry['level']): object {

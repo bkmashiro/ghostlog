@@ -3,10 +3,12 @@ import * as vscode from 'vscode'
 import { detectPattern } from './classifier.js'
 import { applyLens, LensStore } from './lens.js'
 import { registerCommands } from './commands.js'
+import { DecorationDebouncer } from './debounce.js'
 import { buildDecorationText, getDecorationOptions } from './decorator.js'
 import { LogDiffManager, type LogDiff } from './diff.js'
 import { LogHoverProvider } from './hover.js'
 import { generateInjectionScript } from './injector.js'
+import { LogBufferManager } from './log-buffer.js'
 import { LogViewerProvider } from './log-viewer.js'
 import { LogpointManager, type Logpoint } from './logpoint.js'
 import { startMcpServer, type McpServerHandle } from './mcp-server.js'
@@ -40,12 +42,14 @@ class GhostLogController {
   private readonly entriesByFile = new Map<string, EntriesByLine>()
   private readonly terminalBuffers = new Map<string, string>()
   private readonly entryOrder: LogEntry[] = []
+  private logBuffers: LogBufferManager
   private readonly diffManager = new LogDiffManager()
   private readonly lensStore = new LensStore()
   private readonly pinStore = new PinStore()
   private readonly logViewer: LogViewerProvider
   private readonly logpointManager: LogpointManager
   private readonly replPanel: ReplPanelProvider
+  private decorationDebouncer: DecorationDebouncer
   private ghostlogBreakpoints: vscode.SourceBreakpoint[] = []
   private currentDiff?: LogDiff
   private mcpServer?: McpServerHandle
@@ -53,6 +57,8 @@ class GhostLogController {
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.enabled = this.getConfig<boolean>('enabled', true)
+    this.logBuffers = this.createLogBufferManager()
+    this.decorationDebouncer = this.createDecorationDebouncer()
     const workspaceRoot = this.getWorkspaceRoot()
     if (workspaceRoot) {
       this.lensStore.load(workspaceRoot)
@@ -78,6 +84,7 @@ class GhostLogController {
   }
 
   dispose(): void {
+    this.decorationDebouncer.dispose()
     for (const decorationType of Object.values(this.decorationTypes)) {
       decorationType.dispose()
     }
@@ -127,6 +134,16 @@ class GhostLogController {
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration('ghostlog')) {
           this.enabled = this.getConfig<boolean>('enabled', true)
+          if (
+            event.affectsConfiguration('ghostlog.deltaCapacity') ||
+            event.affectsConfiguration('ghostlog.maxValueKB')
+          ) {
+            this.rebuildLogBuffers()
+          }
+          if (event.affectsConfiguration('ghostlog.uiDebounceMs')) {
+            this.decorationDebouncer.dispose()
+            this.decorationDebouncer = this.createDecorationDebouncer()
+          }
           if (this.getConfig<boolean>('mcpEnabled', false)) {
             this.startMcp()
           } else {
@@ -213,6 +230,7 @@ class GhostLogController {
   private clearAll(): void {
     this.entriesByFile.clear()
     this.entryOrder.length = 0
+    this.logBuffers.clear()
     this.currentDiff = undefined
     this.refreshViewer()
     this.syncReplContext()
@@ -224,6 +242,7 @@ class GhostLogController {
       return
     }
     this.entriesByFile.delete(filePath)
+    this.logBuffers.clear(filePath)
     for (let index = this.entryOrder.length - 1; index >= 0; index -= 1) {
       if (this.entryOrder[index].file === filePath) {
         this.entryOrder.splice(index, 1)
@@ -430,10 +449,13 @@ class GhostLogController {
     byLine.set(line, [...entries, nextEntry])
     this.entriesByFile.set(filePath, byLine)
     this.entryOrder.push(nextEntry)
+    if (nextEntry.parsedValue !== undefined) {
+      this.logBuffers.add(filePath, line, nextEntry.parsedValue, nextEntry.timestamp)
+    }
     this.currentDiff = undefined
     this.refreshViewer()
     this.syncReplContext()
-    this.renderEditorForFile(filePath)
+    this.decorationDebouncer.mark(filePath)
   }
 
   private syncReplContext(): void {
@@ -503,11 +525,10 @@ class GhostLogController {
             renderOptions: {
               after: {
                 contentText: buildDecorationText(
-                  entries
-                    .slice(-this.getConfig<number>('maxLoopValues', 5))
-                    .map((entry) => this.truncateEntry(entry)),
+                  entries.map((entry) => this.truncateEntry(entry)),
                   {
-                    patternSummary: summarizeEntryPatterns(entries)
+                    patternSummary: summarizeEntryPatterns(entries),
+                    buffer: this.logBuffers.get(editor.document.uri.fsPath, lineNumber)
                   }
                 )
               }
@@ -523,7 +544,7 @@ class GhostLogController {
     if (entry.kind === 'network' || entry.kind === 'timing') {
       return entry
     }
-    const maxValueLength = this.getConfig<number>('maxValueLength', 60)
+    const maxValueLength = 200
     return {
       ...entry,
       values: entry.values.map((value) => truncateValue(value, maxValueLength))
@@ -740,6 +761,14 @@ class GhostLogController {
 
     const rebuilt = entries.map((entry) => this.annotateEntry(filePath, line, entry, false))
     byLine!.set(line, [...rebuilt])
+    this.logBuffers.clear(filePath)
+    for (const [lineNumber, lineEntries] of byLine!.entries()) {
+      for (const lineEntry of lineEntries) {
+        if (lineEntry.parsedValue !== undefined) {
+          this.logBuffers.add(filePath, lineNumber, lineEntry.parsedValue, lineEntry.timestamp)
+        }
+      }
+    }
     for (let index = 0; index < this.entryOrder.length; index += 1) {
       const entry = this.entryOrder[index]
       if (entry.file === filePath && entry.line === line) {
@@ -749,6 +778,7 @@ class GhostLogController {
         }
       }
     }
+    this.decorationDebouncer.mark(filePath)
   }
 
   private buildLineViewerCommand(file: string, line: number): string {
@@ -786,6 +816,34 @@ class GhostLogController {
       return
     }
     this.lensStore.save(workspaceRoot)
+  }
+
+  private createLogBufferManager(): LogBufferManager {
+    return new LogBufferManager({
+      deltaCapacity: this.getConfig<number>('deltaCapacity', 200),
+      maxValueBytes: this.getConfig<number>('maxValueKB', 10) * 1024
+    })
+  }
+
+  private createDecorationDebouncer(): DecorationDebouncer {
+    return new DecorationDebouncer(this.getConfig<number>('uiDebounceMs', 200), (files) => {
+      for (const file of files) {
+        this.renderEditorForFile(file)
+      }
+    })
+  }
+
+  private rebuildLogBuffers(): void {
+    this.logBuffers = this.createLogBufferManager()
+    for (const [file, byLine] of this.entriesByFile.entries()) {
+      for (const [line, entries] of byLine.entries()) {
+        for (const entry of entries) {
+          if (entry.parsedValue !== undefined) {
+            this.logBuffers.add(file, line, entry.parsedValue, entry.timestamp)
+          }
+        }
+      }
+    }
   }
 
   private async injectDebugRuntime(session: vscode.DebugSession): Promise<void> {

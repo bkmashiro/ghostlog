@@ -186,6 +186,9 @@ function normalizeExpression(expression) {
   }
   return trimmed;
 }
+function isArrowExpression(expression) {
+  return /^\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(expression);
+}
 function applyLens(value, expression) {
   const normalized = normalizeExpression(expression);
   const sandbox = /* @__PURE__ */ Object.create(null);
@@ -202,7 +205,7 @@ function applyLens(value, expression) {
   sandbox.Date = Date;
   sandbox.RegExp = RegExp;
   try {
-    const isArrow = normalized.includes("=>");
+    const isArrow = isArrowExpression(normalized);
     const result = vm.runInNewContext(
       isArrow ? `(${normalized})(x)` : normalized,
       sandbox,
@@ -242,6 +245,52 @@ function registerCommands(handlers) {
     vscode.commands.registerCommand("ghostlog.focusLineInViewer", handlers.focusLineInViewer)
   ];
 }
+
+// src/debounce.ts
+var DecorationDebouncer = class {
+  constructor(debounceMs, onFlush) {
+    this.debounceMs = debounceMs;
+    this.onFlush = onFlush;
+  }
+  pending = /* @__PURE__ */ new Set();
+  timer = null;
+  disposed = false;
+  mark(file) {
+    if (this.disposed) {
+      return;
+    }
+    this.pending.add(file);
+    if (this.timer) {
+      return;
+    }
+    this.timer = setTimeout(() => {
+      this.flush();
+    }, this.debounceMs);
+  }
+  flush() {
+    if (this.disposed) {
+      return;
+    }
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (this.pending.size === 0) {
+      return;
+    }
+    const files = new Set(this.pending);
+    this.pending.clear();
+    this.onFlush(files);
+  }
+  dispose() {
+    this.disposed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.pending.clear();
+  }
+};
 
 // src/parser.ts
 var GHOSTLOG_PREFIX = "__GHOSTLOG__";
@@ -591,6 +640,169 @@ function formatValue(value, maxDepth = 3) {
   return String(value);
 }
 
+// src/delta.ts
+function isPlainObject2(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+function detectType(value) {
+  if (value === null) {
+    return "null";
+  }
+  if (Array.isArray(value)) {
+    return "array";
+  }
+  if (typeof value === "object") {
+    return "object";
+  }
+  return "primitive";
+}
+function stringifyValue(value) {
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (value === void 0) {
+    return "undefined";
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+function cloneIfPossible(value) {
+  if (value === void 0) {
+    return value;
+  }
+  try {
+    return structuredClone(value);
+  } catch {
+    return value;
+  }
+}
+function getComparableType(value) {
+  if (value === null) {
+    return "null";
+  }
+  if (Array.isArray(value)) {
+    return "array";
+  }
+  if (isPlainObject2(value)) {
+    return "object";
+  }
+  return "primitive";
+}
+function applyDeltaInternal(current, delta) {
+  if (delta.isFullReset) {
+    return cloneIfPossible(delta.changes.$);
+  }
+  if (Array.isArray(current)) {
+    const next = [...current];
+    for (const key of delta.removed) {
+      const index = Number(key);
+      if (Number.isInteger(index) && index >= 0) {
+        delete next[index];
+      }
+    }
+    for (const [key, value] of Object.entries(delta.changes)) {
+      const index = Number(key);
+      if (Number.isInteger(index) && index >= 0) {
+        next[index] = cloneIfPossible(value);
+      }
+    }
+    return next;
+  }
+  const base = current !== null && typeof current === "object" && !Array.isArray(current) ? { ...current } : {};
+  for (const key of delta.removed) {
+    delete base[key];
+  }
+  for (const [key, value] of Object.entries(delta.changes)) {
+    base[key] = cloneIfPossible(value);
+  }
+  return base;
+}
+function serializeValue(value, maxBytes = 10240) {
+  const fullRaw = stringifyValue(value);
+  const size = Buffer.byteLength(fullRaw, "utf8");
+  return {
+    type: detectType(value),
+    raw: fullRaw.length > 200 ? `${fullRaw.slice(0, 197)}...` : fullRaw,
+    full: size <= maxBytes ? cloneIfPossible(value) : void 0,
+    size
+  };
+}
+function computeDelta(prev, next, seq) {
+  if (prev === next) {
+    return null;
+  }
+  const prevType = getComparableType(prev);
+  const nextType = getComparableType(next);
+  if (prevType !== nextType || nextType === "primitive" || nextType === "null") {
+    return {
+      seq,
+      timestamp: Date.now(),
+      changes: { $: cloneIfPossible(next) },
+      removed: [],
+      isFullReset: true
+    };
+  }
+  const prevRecord = Array.isArray(prev) ? Object.fromEntries(prev.map((value, index) => [String(index), value])) : prev;
+  const nextRecord = Array.isArray(next) ? Object.fromEntries(next.map((value, index) => [String(index), value])) : next;
+  const changes = {};
+  const removed = [];
+  const keys = /* @__PURE__ */ new Set([...Object.keys(prevRecord), ...Object.keys(nextRecord)]);
+  for (const key of keys) {
+    const inPrev = Object.prototype.hasOwnProperty.call(prevRecord, key);
+    const inNext = Object.prototype.hasOwnProperty.call(nextRecord, key);
+    if (inPrev && !inNext) {
+      removed.push(key);
+      continue;
+    }
+    if (!inPrev || prevRecord[key] !== nextRecord[key]) {
+      changes[key] = cloneIfPossible(nextRecord[key]);
+    }
+  }
+  if (removed.length === 0 && Object.keys(changes).length === 0) {
+    return null;
+  }
+  return {
+    seq,
+    timestamp: Date.now(),
+    changes,
+    removed,
+    isFullReset: false
+  };
+}
+function replayTo(base, deltas, targetSeq) {
+  let current = cloneIfPossible(base);
+  for (const delta of deltas) {
+    if (delta.seq > targetSeq) {
+      break;
+    }
+    current = applyDeltaInternal(current, delta);
+  }
+  return current;
+}
+function analyzeChanges(deltas) {
+  const counts = {};
+  for (const delta of deltas) {
+    for (const key of Object.keys(delta.changes)) {
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+    for (const key of delta.removed) {
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+  }
+  return counts;
+}
+function applyDelta(base, delta) {
+  return applyDeltaInternal(base, delta);
+}
+
 // src/decorator.ts
 function buildDecorationText(entries, options) {
   if (entries.length === 0) {
@@ -616,11 +828,35 @@ function buildDecorationText(entries, options) {
     const rendered = latestLens.error ? `Error: ${latestLens.error}` : formatValue(latestLens.result, 2);
     return `${prefix} (lens: ${latestLens.label ?? latestLens.expression}) \u2192 ${rendered}`;
   }
+  const bufferText = options?.buffer ? buildBufferDecorationText(prefix, options.buffer) : "";
+  if (bufferText) {
+    return bufferText;
+  }
   if (options?.patternSummary) {
     return `${prefix} ${options.patternSummary}`;
   }
   const text = groupEntries(entries);
   return text ? `${prefix} ${text}` : prefix;
+}
+function buildBufferDecorationText(prefix, buffer) {
+  const deltas = buffer.deltas.toArray();
+  const reconstructableEntries = buffer.deltas.size + 1;
+  const latestPreview = buffer.latest.raw;
+  const hotKeys = Object.entries(buffer.changeFrequency).filter(([key]) => key !== "$").sort((left, right) => right[1] - left[1]).slice(0, 3).map(([key]) => key);
+  if (buffer.totalReceived === 1) {
+    return `${prefix} ${latestPreview}`;
+  }
+  if (buffer.totalReceived > 1 && buffer.deltas.size === 0) {
+    return `${prefix} ${latestPreview} \xD7${buffer.totalReceived.toLocaleString()}`;
+  }
+  if (buffer.totalReceived <= 3 && buffer.totalDropped === 0) {
+    const values = [buffer.base].concat(deltas.map((delta) => replayTo(buffer.base, deltas, delta.seq))).slice(0, buffer.totalReceived).map((value) => formatValue(value, 1));
+    return `${prefix} ${values.join(" \u2192 ")}`;
+  }
+  const latestLabel = buffer.latest.full !== void 0 ? formatValue(buffer.latest.full, 1) : latestPreview;
+  const hotKeysLabel = hotKeys.length > 0 ? ` [\u0394 ${hotKeys.join(",")}]` : "";
+  const overflowLabel = buffer.totalDropped > 0 ? ` [last ${reconstructableEntries.toLocaleString()} entries]` : "";
+  return `${prefix} \xD7${buffer.totalReceived.toLocaleString()}${overflowLabel} [${latestLabel}]${hotKeysLabel}`;
 }
 function getDecorationOptions(level) {
   const colorByLevel = {
@@ -829,6 +1065,177 @@ function generateInjectionScript() {
 })();
 `.trim();
 }
+
+// src/ring-buffer.ts
+var RingBuffer = class {
+  buffer;
+  head = 0;
+  _size = 0;
+  capacity;
+  constructor(capacity) {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new Error("RingBuffer capacity must be a positive integer");
+    }
+    this.capacity = capacity;
+    this.buffer = new Array(capacity);
+  }
+  push(item) {
+    const evicted = this.isFull ? this.buffer[this.head] : void 0;
+    this.buffer[this.head] = item;
+    this.head = (this.head + 1) % this.capacity;
+    if (!this.isFull) {
+      this._size += 1;
+    }
+    return evicted;
+  }
+  get(index) {
+    if (index < 0 || index >= this._size) {
+      return void 0;
+    }
+    const start = this.isFull ? this.head : 0;
+    return this.buffer[(start + index) % this.capacity];
+  }
+  latest() {
+    if (this._size === 0) {
+      return void 0;
+    }
+    const index = (this.head - 1 + this.capacity) % this.capacity;
+    return this.buffer[index];
+  }
+  oldest() {
+    return this.get(0);
+  }
+  *[Symbol.iterator]() {
+    for (let index = 0; index < this._size; index += 1) {
+      const item = this.get(index);
+      if (item !== void 0) {
+        yield item;
+      }
+    }
+  }
+  toArray() {
+    return [...this];
+  }
+  get size() {
+    return this._size;
+  }
+  get isFull() {
+    return this._size === this.capacity;
+  }
+  clear() {
+    this.buffer = new Array(this.capacity);
+    this.head = 0;
+    this._size = 0;
+  }
+};
+
+// src/log-buffer.ts
+var DEFAULT_CONFIG = {
+  deltaCapacity: 200,
+  maxValueBytes: 10240
+};
+function toKey(file, line) {
+  return `${file}:${line}`;
+}
+function cloneValue(value) {
+  if (value === void 0) {
+    return value;
+  }
+  try {
+    return structuredClone(value);
+  } catch {
+    return value;
+  }
+}
+var LogBufferManager = class {
+  buffers = /* @__PURE__ */ new Map();
+  config;
+  constructor(config) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+  add(file, line, value, timestamp = Date.now()) {
+    const key = toKey(file, line);
+    const existing = this.buffers.get(key);
+    if (!existing) {
+      this.buffers.set(key, {
+        file,
+        line,
+        base: cloneValue(value),
+        baseSeq: 0,
+        deltas: new RingBuffer(this.config.deltaCapacity),
+        totalReceived: 1,
+        totalDropped: 0,
+        latest: serializeValue(value, this.config.maxValueBytes),
+        changeFrequency: {}
+      });
+      return "stored";
+    }
+    const nextSeq = existing.totalReceived;
+    const previousValue = this.reconstruct(file, line, existing.totalReceived - 1);
+    existing.totalReceived += 1;
+    existing.latest = serializeValue(value, this.config.maxValueBytes);
+    const delta = computeDelta(previousValue, value, nextSeq);
+    if (!delta) {
+      return "deduplicated";
+    }
+    delta.timestamp = timestamp;
+    const evicted = existing.deltas.push(delta);
+    if (evicted) {
+      existing.base = applyDelta(existing.base, evicted);
+      existing.baseSeq = evicted.seq;
+      existing.totalDropped += 1;
+    }
+    for (const [changedKey, count] of Object.entries(analyzeChanges([delta]))) {
+      existing.changeFrequency[changedKey] = (existing.changeFrequency[changedKey] ?? 0) + count;
+    }
+    return "stored";
+  }
+  get(file, line) {
+    return this.buffers.get(toKey(file, line));
+  }
+  reconstruct(file, line, seq) {
+    const buffer = this.get(file, line);
+    if (!buffer) {
+      return void 0;
+    }
+    if (seq < buffer.baseSeq || seq >= buffer.totalReceived) {
+      return void 0;
+    }
+    if (seq === buffer.baseSeq) {
+      return cloneValue(buffer.base);
+    }
+    return replayTo(cloneValue(buffer.base), buffer.deltas.toArray(), seq);
+  }
+  getAll(file, line) {
+    if (typeof file === "string" && typeof line === "number") {
+      const buffer = this.get(file, line);
+      if (!buffer) {
+        return [];
+      }
+      const entries = [
+        { seq: buffer.baseSeq, timestamp: 0, value: cloneValue(buffer.base) }
+      ];
+      let current = cloneValue(buffer.base);
+      for (const delta of buffer.deltas) {
+        current = applyDelta(current, delta);
+        entries.push({ seq: delta.seq, timestamp: delta.timestamp, value: cloneValue(current) });
+      }
+      return entries;
+    }
+    return [...this.buffers.values()];
+  }
+  clear(file) {
+    if (typeof file !== "string") {
+      this.buffers.clear();
+      return;
+    }
+    for (const key of [...this.buffers.keys()]) {
+      if (key.startsWith(`${file}:`)) {
+        this.buffers.delete(key);
+      }
+    }
+  }
+};
 
 // src/log-viewer.ts
 var vscode3 = __toESM(require("vscode"));
@@ -1867,6 +2274,8 @@ var GhostLogController = class {
   constructor(context) {
     this.context = context;
     this.enabled = this.getConfig("enabled", true);
+    this.logBuffers = this.createLogBufferManager();
+    this.decorationDebouncer = this.createDecorationDebouncer();
     const workspaceRoot = this.getWorkspaceRoot();
     if (workspaceRoot) {
       this.lensStore.load(workspaceRoot);
@@ -1896,17 +2305,20 @@ var GhostLogController = class {
   entriesByFile = /* @__PURE__ */ new Map();
   terminalBuffers = /* @__PURE__ */ new Map();
   entryOrder = [];
+  logBuffers;
   diffManager = new LogDiffManager();
   lensStore = new LensStore();
   pinStore = new PinStore();
   logViewer;
   logpointManager;
   replPanel;
+  decorationDebouncer;
   ghostlogBreakpoints = [];
   currentDiff;
   mcpServer;
   enabled;
   dispose() {
+    this.decorationDebouncer.dispose();
     for (const decorationType of Object.values(this.decorationTypes)) {
       decorationType.dispose();
     }
@@ -1953,6 +2365,13 @@ var GhostLogController = class {
       vscode4.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration("ghostlog")) {
           this.enabled = this.getConfig("enabled", true);
+          if (event.affectsConfiguration("ghostlog.deltaCapacity") || event.affectsConfiguration("ghostlog.maxValueKB")) {
+            this.rebuildLogBuffers();
+          }
+          if (event.affectsConfiguration("ghostlog.uiDebounceMs")) {
+            this.decorationDebouncer.dispose();
+            this.decorationDebouncer = this.createDecorationDebouncer();
+          }
           if (this.getConfig("mcpEnabled", false)) {
             this.startMcp();
           } else {
@@ -2024,6 +2443,7 @@ var GhostLogController = class {
   clearAll() {
     this.entriesByFile.clear();
     this.entryOrder.length = 0;
+    this.logBuffers.clear();
     this.currentDiff = void 0;
     this.refreshViewer();
     this.syncReplContext();
@@ -2034,6 +2454,7 @@ var GhostLogController = class {
       return;
     }
     this.entriesByFile.delete(filePath);
+    this.logBuffers.clear(filePath);
     for (let index = this.entryOrder.length - 1; index >= 0; index -= 1) {
       if (this.entryOrder[index].file === filePath) {
         this.entryOrder.splice(index, 1);
@@ -2194,10 +2615,13 @@ var GhostLogController = class {
     byLine.set(line, [...entries, nextEntry]);
     this.entriesByFile.set(filePath, byLine);
     this.entryOrder.push(nextEntry);
+    if (nextEntry.parsedValue !== void 0) {
+      this.logBuffers.add(filePath, line, nextEntry.parsedValue, nextEntry.timestamp);
+    }
     this.currentDiff = void 0;
     this.refreshViewer();
     this.syncReplContext();
-    this.renderEditorForFile(filePath);
+    this.decorationDebouncer.mark(filePath);
   }
   syncReplContext() {
     const recentEntries = this.entryOrder.filter((entry) => entry.kind !== "network" && entry.kind !== "timing").slice(-25).reverse();
@@ -2252,9 +2676,10 @@ var GhostLogController = class {
             renderOptions: {
               after: {
                 contentText: buildDecorationText(
-                  entries.slice(-this.getConfig("maxLoopValues", 5)).map((entry) => this.truncateEntry(entry)),
+                  entries.map((entry) => this.truncateEntry(entry)),
                   {
-                    patternSummary: summarizeEntryPatterns(entries)
+                    patternSummary: summarizeEntryPatterns(entries),
+                    buffer: this.logBuffers.get(editor.document.uri.fsPath, lineNumber)
                   }
                 )
               }
@@ -2269,7 +2694,7 @@ var GhostLogController = class {
     if (entry.kind === "network" || entry.kind === "timing") {
       return entry;
     }
-    const maxValueLength = this.getConfig("maxValueLength", 60);
+    const maxValueLength = 200;
     return {
       ...entry,
       values: entry.values.map((value) => truncateValue(value, maxValueLength))
@@ -2465,6 +2890,14 @@ var GhostLogController = class {
     }
     const rebuilt = entries.map((entry) => this.annotateEntry(filePath, line, entry, false));
     byLine.set(line, [...rebuilt]);
+    this.logBuffers.clear(filePath);
+    for (const [lineNumber, lineEntries] of byLine.entries()) {
+      for (const lineEntry of lineEntries) {
+        if (lineEntry.parsedValue !== void 0) {
+          this.logBuffers.add(filePath, lineNumber, lineEntry.parsedValue, lineEntry.timestamp);
+        }
+      }
+    }
     for (let index = 0; index < this.entryOrder.length; index += 1) {
       const entry = this.entryOrder[index];
       if (entry.file === filePath && entry.line === line) {
@@ -2474,6 +2907,7 @@ var GhostLogController = class {
         }
       }
     }
+    this.decorationDebouncer.mark(filePath);
   }
   buildLineViewerCommand(file, line) {
     return `command:ghostlog.focusLineInViewer?${encodeURIComponent(JSON.stringify([file, line]))}`;
@@ -2506,6 +2940,31 @@ var GhostLogController = class {
       return;
     }
     this.lensStore.save(workspaceRoot);
+  }
+  createLogBufferManager() {
+    return new LogBufferManager({
+      deltaCapacity: this.getConfig("deltaCapacity", 200),
+      maxValueBytes: this.getConfig("maxValueKB", 10) * 1024
+    });
+  }
+  createDecorationDebouncer() {
+    return new DecorationDebouncer(this.getConfig("uiDebounceMs", 200), (files) => {
+      for (const file of files) {
+        this.renderEditorForFile(file);
+      }
+    });
+  }
+  rebuildLogBuffers() {
+    this.logBuffers = this.createLogBufferManager();
+    for (const [file, byLine] of this.entriesByFile.entries()) {
+      for (const [line, entries] of byLine.entries()) {
+        for (const entry of entries) {
+          if (entry.parsedValue !== void 0) {
+            this.logBuffers.add(file, line, entry.parsedValue, entry.timestamp);
+          }
+        }
+      }
+    }
   }
   async injectDebugRuntime(session) {
     try {

@@ -106,15 +106,20 @@
     "configuration": {
       "title": "GhostLog",
       "properties": {
-        "ghostlog.maxValueLength": {
+        "ghostlog.deltaCapacity": {
           "type": "number",
-          "default": 60,
-          "description": "Max characters to show per value"
+          "default": 200,
+          "description": "Max delta entries to store per log line"
         },
-        "ghostlog.maxLoopValues": {
+        "ghostlog.maxValueKB": {
           "type": "number",
-          "default": 5,
-          "description": "Max values to show for loops"
+          "default": 10,
+          "description": "Max KB to store full value (larger values stored as preview)"
+        },
+        "ghostlog.uiDebounceMs": {
+          "type": "number",
+          "default": 200,
+          "description": "Decoration update debounce in ms"
         },
         "ghostlog.enabled": {
           "type": "boolean",
