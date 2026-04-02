@@ -1,0 +1,70 @@
+{
+  "name": "ghostlog",
+  "displayName": "GhostLog",
+  "description": "Inline console.log value display - free ConsoleNinja alternative",
+  "version": "0.1.0",
+  "publisher": "bkmashiro",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ghostlog.clear",
+        "title": "GhostLog: Clear All Inline Values"
+      },
+      {
+        "command": "ghostlog.toggle",
+        "title": "GhostLog: Toggle Inline Display"
+      },
+      {
+        "command": "ghostlog.clearFile",
+        "title": "GhostLog: Clear This File"
+      }
+    ],
+    "configuration": {
+      "title": "GhostLog",
+      "properties": {
+        "ghostlog.maxValueLength": {
+          "type": "number",
+          "default": 60,
+          "description": "Max characters to show per value"
+        },
+        "ghostlog.maxLoopValues": {
+          "type": "number",
+          "default": 5,
+          "description": "Max values to show for loops"
+        },
+        "ghostlog.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable/disable inline display"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --platform=node --external:vscode --outfile=dist/extension.js --format=cjs",
+    "test": "tsx --test test/**/*.test.ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vsce": "^2.15.0"
+  }
+}
